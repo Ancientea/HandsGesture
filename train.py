@@ -85,10 +85,14 @@ if __name__ == "__main__":
     )
 
     # 保存模型结构和权重
-    model_json = model.to_json()
-    with open("model_architecture.json", "w") as json_file:
-        json_file.write(model_json)
-    model.save_weights("model_weights.h5")
+    print("保存模型结构和权重...")
+    try:
+        # 保存为SavedModel格式
+        model.save("saved_model")
+        print("模型保存成功")
+        
+    except Exception as e:
+        print(f"保存模型时出错: {str(e)}")
 
     # 评估
     test_loss, test_acc = model.evaluate(X_test, y_test)
