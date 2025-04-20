@@ -3,13 +3,32 @@ import os
 import cv2
 import numpy as np
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QVBoxLayout, QWidget, QHBoxLayout
+from PyQt5.QtGui import QImage, QPixmap, QFont
+from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QVBoxLayout, QWidget, QHBoxLayout, QShortcut
+from PyQt5.QtGui import QKeySequence
 import mediapipe as mp
 from collections import deque
 
+# 设置全局字体支持中文
+def set_global_font():
+    font = QFont()
+    font.setFamily("Microsoft YaHei")  # 微软雅黑
+    # 如果微软雅黑不可用，可以尝试其他中文字体
+    if "Microsoft YaHei" not in QFont().family():
+        font.setFamily("SimHei")  # 黑体
+    QApplication.setFont(font)
+
 # 定义手势类别
 GESTURES = ["right_swipe", "left_swipe", "up_swipe", "down_swipe", "click", "pinch"]
+# 定义手势中文名称
+GESTURE_NAMES = {
+    "right_swipe": "右滑",
+    "left_swipe": "左滑",
+    "up_swipe": "上滑",
+    "down_swipe": "下滑",
+    "click": "点击",
+    "pinch": "捏合"
+}
 DATA_DIR = "gesture_data"  # 数据集保存目录
 FRAME_COUNT = 30  # 1秒采集30帧
 mp_drawing = mp.solutions.drawing_utils  # 添加绘图工具
@@ -21,17 +40,29 @@ STABLE_FRAMES = 5  # 稳定帧数阈值
 class CameraThread(QThread):
     frame_signal = pyqtSignal(np.ndarray)
 
+    def __init__(self, camera_id=0):#这里可以更改你的摄像头id
+        super().__init__()
+        self.camera_id = camera_id
+        self.running = True
+
     def run(self):
-        self.cap = cv2.VideoCapture(1)
-        while True:
+        self.cap = cv2.VideoCapture(self.camera_id)
+        if not self.cap.isOpened():
+            print(f"错误: 无法打开摄像头 ID {self.camera_id}")
+            return
+            
+        while self.running:
             ret, frame = self.cap.read()
             if ret:
                 self.frame_signal.emit(frame)
             else:
+                print("警告: 无法读取摄像头画面")
                 break
 
     def stop(self):
-        self.cap.release()
+        self.running = False
+        if hasattr(self, 'cap') and self.cap.isOpened():
+            self.cap.release()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -46,6 +77,7 @@ class MainWindow(QMainWindow):
         self.camera_thread = CameraThread()
         self.camera_thread.frame_signal.connect(self.update_frame)
         self.camera_thread.start()
+        self.setup_shortcuts()
 
     def init_ui(self):
         self.setWindowTitle("手势数据收集")
@@ -54,8 +86,11 @@ class MainWindow(QMainWindow):
         # 创建按钮布局
         button_layout = QHBoxLayout()
         self.gesture_buttons = {}
-        for gesture in GESTURES:
-            btn = QPushButton(gesture)
+        for i, gesture in enumerate(GESTURES):
+            # 使用中文名称 + 英文名称
+            btn_text = f"{i+1}: {GESTURE_NAMES[gesture]}({gesture})"
+            btn = QPushButton(btn_text)
+            btn.setFont(QFont("Microsoft YaHei", 9))  # 设置按钮字体
             btn.clicked.connect(lambda _, g=gesture: self.start_collect(g))
             button_layout.addWidget(btn)
             self.gesture_buttons[gesture] = btn
@@ -63,6 +98,7 @@ class MainWindow(QMainWindow):
         # 状态显示
         self.status_label = QLabel("准备就绪")
         self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))  # 设置字体
         
         # 图像显示区域
         self.image_label = QLabel()
@@ -74,9 +110,23 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.status_label)
         main_layout.addWidget(self.image_label)
 
+        # 说明标签
+        help_label = QLabel("按键1-6可以快速选择对应的手势，ESC键取消当前采集")
+        help_label.setAlignment(Qt.AlignCenter)
+        help_label.setFont(QFont("Microsoft YaHei", 9))  # 设置字体
+        main_layout.addWidget(help_label)
+
         container = QWidget()
         container.setLayout(main_layout)
         self.setCentralWidget(container)
+
+    def setup_shortcuts(self):
+        """设置键盘快捷键"""
+        for i, gesture in enumerate(GESTURES):
+            # 创建快捷键 1-6，对应六种手势
+            shortcut = QShortcut(QKeySequence(str(i+1)), self)
+            shortcut.activated.connect(lambda g=gesture: self.start_collect(g))
+            print(f"设置快捷键 {i+1} 对应手势 {GESTURE_NAMES[gesture]}({gesture})")
 
     def init_mediapipe(self):
         self.mp_hands = mp.solutions.hands
@@ -92,9 +142,17 @@ class MainWindow(QMainWindow):
         self.motion_buffer.clear()
         self.position_buffer.clear()
         self.stable_frames = 0
-        self.status_label.setText(f"正在收集: {gesture}")
+        self.status_label.setText(f"正在收集: {GESTURE_NAMES[gesture]}({gesture})")
         self.status_label.setStyleSheet("color: green; font-weight: bold;")
-        print(f"开始收集手势: {gesture}")
+        
+        # 高亮显示选中的按钮
+        for g, btn in self.gesture_buttons.items():
+            if g == gesture:
+                btn.setStyleSheet("background-color: lightgreen; font-weight: bold;")
+            else:
+                btn.setStyleSheet("")
+                
+        print(f"开始收集手势: {GESTURE_NAMES[gesture]}({gesture})")
 
     def process_frame(self, frame):
         # 转换为RGB格式
@@ -144,15 +202,36 @@ class MainWindow(QMainWindow):
             # 更新缓冲区
             self.position_buffer.append(current_data)
             self.motion_buffer.append(motion)
-
-            # 在画面上显示运动量
-            cv2.putText(draw_frame, f"Motion: {motion:.2f}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         else:
             original_landmarks = [0] * 63
             mirrored_landmarks = [0] * 63
 
         return original_landmarks, mirrored_landmarks, draw_frame, motion
+
+    def add_chinese_text_to_image(self, img, text, position, font_scale=0.7, color=(0, 255, 0), thickness=2):
+        """使用OpenCV添加中文文本到图像上"""
+        # OpenCV不直接支持中文，我们使用PIL库进行转换
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            import numpy as np
+            
+            # 创建PIL图像
+            pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_img)
+            
+            # 加载字体
+            fontpath = os.path.join(os.getenv('SystemRoot', 'C:\\Windows'), 'Fonts', 'simhei.ttf') 
+            font = ImageFont.truetype(fontpath, int(font_scale * 20))
+            
+            # 绘制文本
+            draw.text(position, text, font=font, fill=color[::-1])  # OpenCV是BGR，PIL是RGB
+            
+            # 转换回OpenCV格式
+            return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        except ImportError:
+            # 如果没有PIL库，回退到OpenCV的英文显示
+            cv2.putText(img, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
+            return img
 
     def update_frame(self, frame):
         # 处理原始帧并获取坐标
@@ -160,17 +239,71 @@ class MainWindow(QMainWindow):
 
         # 显示带骨架的镜像画面
         if draw_frame is not None:
+            # 先镜像然后再添加文本，这样文本就不会被镜像
             mirrored_display = cv2.flip(draw_frame, 1)
         else:
             mirrored_display = cv2.flip(frame, 1)
+            
+        # 在镜像后的图像上添加运动量显示
+        h, w, _ = mirrored_display.shape
+        
+        # 添加英文信息 - 运动量
+        cv2.putText(mirrored_display, f"Motion: {motion:.2f}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         # 绘制状态圆圈
-        h, w, _ = mirrored_display.shape
         circle_color = (0, 255, 0) if self.current_gesture and (orig_landmarks != [0] * 63) else (0, 0, 255)
         cv2.circle(mirrored_display, (50, 50), 20, circle_color, -1)
+        
+        # 显示当前选择的手势 - 使用add_chinese_text_to_image方法添加中文
+        if self.current_gesture:
+            # 先用OpenCV添加英文信息
+            gesture_text = f"Gesture: {self.current_gesture}"
+            cv2.putText(mirrored_display, gesture_text, (10, h - 80),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            
+            # 显示中文手势名称 - 使用PIL
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                
+                # 创建PIL图像
+                pil_img = Image.fromarray(cv2.cvtColor(mirrored_display, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(pil_img)
+                
+                # 尝试加载字体
+                try:
+                    # 尝试使用系统字体
+                    fontpath = os.path.join(os.getenv('SystemRoot', 'C:\\Windows'), 'Fonts', 'simhei.ttf')
+                    font = ImageFont.truetype(fontpath, 24)
+                except:
+                    # 如果失败，尝试使用默认字体
+                    font = ImageFont.load_default()
+                
+                # 绘制中文文本
+                chinese_text = f"手势: {GESTURE_NAMES[self.current_gesture]}"
+                draw.text((10, h - 50), chinese_text, font=font, fill=(0, 0, 255))
+                
+                # 绘制帧数信息
+                frames_text = f"帧数: {len(self.frames_buffer)}/{FRAME_COUNT}"
+                draw.text((w - 200, h - 50), frames_text, font=font, fill=(0, 0, 255))
+                
+                # 转换回OpenCV格式
+                mirrored_display = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            except ImportError:
+                # 如果PIL导入失败，退回到OpenCV英文显示
+                print("警告: 未安装PIL库，无法显示中文。请安装PIL: pip install pillow")
+                frames_text = f"Frame: {len(self.frames_buffer)}/{FRAME_COUNT}"
+                cv2.putText(mirrored_display, frames_text, (w - 200, h - 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            except Exception as e:
+                print(f"渲染中文文本时出错: {e}")
+                # 退回到英文显示
+                frames_text = f"Frame: {len(self.frames_buffer)}/{FRAME_COUNT}"
+                cv2.putText(mirrored_display, frames_text, (w - 200, h - 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
         # 转换为 QImage 并显示
-        q_img = QImage(mirrored_display.data, w, h, QImage.Format_RGB888).rgbSwapped()
+        q_img = QImage(mirrored_display.data, w, h, w * 3, QImage.Format_RGB888).rgbSwapped()
         self.image_label.setPixmap(QPixmap.fromImage(q_img))
 
         # 如果正在收集数据且检测到手部
@@ -196,7 +329,11 @@ class MainWindow(QMainWindow):
                 self.frames_buffer = []
                 self.stable_frames = 0
                 self.status_label.setText("准备就绪")
-                self.status_label.setStyleSheet("color: black; font-weight: normal;")
+                self.status_label.setStyleSheet("color: black; font-weight: bold;")
+                
+                # 重置按钮样式
+                for g, btn in self.gesture_buttons.items():
+                    btn.setStyleSheet("")
 
     def validate_data_quality(self):
         """验证数据质量"""
@@ -304,9 +441,32 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.camera_thread.stop()
         event.accept()
+        
+    def keyPressEvent(self, event):
+        """处理按键事件"""
+        if Qt.Key_1 <= event.key() <= Qt.Key_6:
+            # 按键1-6对应手势列表中的索引0-5
+            index = event.key() - Qt.Key_1
+            if 0 <= index < len(GESTURES):
+                self.start_collect(GESTURES[index])
+        elif event.key() == Qt.Key_Escape:  # ESC键停止当前收集
+            if self.current_gesture:
+                self.current_gesture = None
+                self.frames_buffer = []
+                self.stable_frames = 0
+                self.status_label.setText("已取消")
+                self.status_label.setStyleSheet("color: red; font-weight: normal;")
+                
+                # 重置按钮样式
+                for g, btn in self.gesture_buttons.items():
+                    btn.setStyleSheet("")
+                    
+                print("已取消当前手势收集")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    # 设置全局字体
+    set_global_font()
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
