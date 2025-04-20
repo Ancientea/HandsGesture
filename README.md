@@ -182,9 +182,6 @@ python train.py
    - 检查计算机性能是否满足要求
    - 考虑使用具有更好性能的GPU
 
-## 许可证
-
-MIT License
 
 ## 贡献与反馈
 
