@@ -1,11 +1,10 @@
-
 import cv2
 import mediapipe as mp
 import numpy as np
 from PIL import Image
 
 #获取摄像头数据
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(1)
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands()
 mp_drawing = mp.solutions.drawing_utils
