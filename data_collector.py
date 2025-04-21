@@ -40,7 +40,7 @@ STABLE_FRAMES = 5  # 稳定帧数阈值
 class CameraThread(QThread):
     frame_signal = pyqtSignal(np.ndarray)
 
-    def __init__(self, camera_id=0):#这里可以更改你的摄像头id.
+    def __init__(self, camera_id=0):#这里可以更改你的摄像头id
         super().__init__()
         self.camera_id = camera_id
         self.running = True

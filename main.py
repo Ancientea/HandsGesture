@@ -5,15 +5,20 @@ import os
 import tensorflow as tf
 from collections import deque
 import mediapipe as mp
+import time
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel,
                             QPushButton, QLineEdit, QVBoxLayout,
-                            QWidget, QHBoxLayout, QMessageBox)
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QObject, QThread
+                            QWidget, QHBoxLayout, QMessageBox, QCheckBox, QRadioButton,
+                            QSizePolicy)
+from PyQt5.QtGui import QImage, QPixmap, QResizeEvent
+from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QObject, QThread, QMutex, QSize
+# 导入自定义模块
+from recognition import GestureRecognition
+from mouseControl import MouseControlThread
 
 # 与train.py保持一致的配置
 # 提前定义手势名称列表，确保顺序一致
-GESTURE_NAMES = ["right_swipe", "left_swipe", "up_swipe", "down_swipe", "click", "pinch"]
+GESTURE_NAMES = ["right_swipe", "left_swipe", "up_swipe", "down_swipe", "click", "pinch", "ok_sign", "peace_sign"]
 # 选定的关键点ID - 掌根(0)、拇指(4)、食指(5,8)、中指(9,12)、无名指(13,16)、小指(17,20)
 SELECTED_LANDMARKS = [0, 4, 5, 9, 13, 17, 8, 12, 16, 20]
 # 更新输入维度
@@ -33,6 +38,158 @@ try:
         print("未检测到GPU设备，将使用CPU")
 except Exception as e:
     print(f"GPU设置错误: {str(e)}")
+
+class CameraThread(QThread):
+    """
+    摄像头线程类：负责处理摄像头捕获和基础处理
+    """
+    raw_frame_signal = pyqtSignal(np.ndarray)  # 原始帧信号
+    processed_frame_signal = pyqtSignal(np.ndarray)  # 处理后帧信号
+    error_signal = pyqtSignal(str)  # 错误信号
+    camera_size_signal = pyqtSignal(int, int)  # 摄像头尺寸信号，用于通知UI
+    
+    def __init__(self, camera_id=0):
+        super().__init__()
+        self.camera_id = camera_id
+        self.running = False
+        self.cap = None
+        self.frame_mutex = QMutex()  # 帧互斥锁，防止同时访问
+        self.latest_frame = None
+        self.latest_processed_frame = None
+        
+        # 摄像头尺寸 - 初始化为默认值
+        self.camera_width = 640
+        self.camera_height = 480
+        
+        # MediaPipe设置 - 基本手部检测
+        self.mp_hands = mp.solutions.hands
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+            model_complexity=0  # 较低复杂度模型
+        )
+        
+        # 性能优化
+        self.frame_interval = 0.02  # 帧间隔控制(50fps)
+        self.last_ui_update_time = 0
+        self.ui_update_interval = 0.04  # UI更新间隔(25fps)
+    
+    def run(self):
+        """线程主循环，捕获并处理摄像头帧"""
+        try:
+            # 打开摄像头
+            self.cap = cv2.VideoCapture(self.camera_id)
+            if not self.cap.isOpened():
+                self.error_signal.emit(f"无法打开摄像头ID: {self.camera_id}")
+                return
+                
+            # 设置摄像头参数 - 尝试设置高分辨率，但最终以实际支持为准
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)  # 尝试设置更高分辨率
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            
+            # 获取实际的摄像头分辨率
+            self.camera_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.camera_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"实际摄像头分辨率: {self.camera_width}x{self.camera_height}")
+            
+            # 发送摄像头尺寸信号
+            self.camera_size_signal.emit(self.camera_width, self.camera_height)
+            
+            # 主循环
+            while self.running:
+                # 捕获帧
+                ret, frame = self.cap.read()
+                if not ret:
+                    self.error_signal.emit("无法读取摄像头画面")
+                    break
+                
+                # 水平翻转（镜像效果）
+                frame = cv2.flip(frame, 1)
+                
+                # 保存最新的原始帧
+                self.frame_mutex.lock()
+                self.latest_frame = frame.copy()
+                self.frame_mutex.unlock()
+                
+                # 发送原始帧信号
+                self.raw_frame_signal.emit(frame.copy())
+                
+                # 处理帧 - 基础手部检测
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = self.hands.process(rgb_frame)
+                
+                # 如果检测到手部，绘制关键点
+                if results.multi_hand_landmarks:
+                    for hand_landmarks in results.multi_hand_landmarks:
+                        self.mp_drawing.draw_landmarks(
+                            frame,
+                            hand_landmarks,
+                            self.mp_hands.HAND_CONNECTIONS
+                        )
+                
+                # 保存处理后的帧
+                self.frame_mutex.lock()
+                self.latest_processed_frame = frame.copy()
+                self.frame_mutex.unlock()
+                
+                # 控制UI更新频率，减少频闪
+                current_time = time.time()
+                if current_time - self.last_ui_update_time >= self.ui_update_interval:
+                    # 发送处理后的帧信号
+                    self.processed_frame_signal.emit(frame.copy())
+                    self.last_ui_update_time = current_time
+                
+                # 控制帧率
+                time.sleep(self.frame_interval)
+        
+        except Exception as e:
+            self.error_signal.emit(f"摄像头线程错误: {str(e)}")
+        
+        finally:
+            # 释放资源
+            if self.cap and self.cap.isOpened():
+                self.cap.release()
+                self.cap = None
+    
+    def get_latest_frame(self):
+        """获取最新的原始帧"""
+        self.frame_mutex.lock()
+        if self.latest_frame is not None:
+            frame = self.latest_frame.copy()
+        else:
+            frame = None
+        self.frame_mutex.unlock()
+        return frame
+    
+    def get_latest_processed_frame(self):
+        """获取最新的处理帧"""
+        self.frame_mutex.lock()
+        if self.latest_processed_frame is not None:
+            frame = self.latest_processed_frame.copy()
+        else:
+            frame = None
+        self.frame_mutex.unlock()
+        return frame
+    
+    def start_camera(self, camera_id=None):
+        """启动摄像头"""
+        if camera_id is not None:
+            self.camera_id = camera_id
+        
+        self.running = True
+        if not self.isRunning():
+            self.start()
+    
+    def stop_camera(self):
+        """停止摄像头"""
+        self.running = False
+        
+        # 等待线程结束
+        if self.isRunning():
+            self.wait()
 
 class ActionState:
     NO_ACTION = 0
@@ -76,13 +233,7 @@ class PredictionWorker(QObject):
             max_idx = np.argmax(gesture_confidences)
             max_confidence = gesture_confidences[max_idx]
             max_gesture = GESTURE_NAMES[max_idx]  # 使用全局定义的GESTURE_NAMES
-            
-            # 输出所有动作的置信度
-            self.status_update.emit("处理预测结果...")
-            print("\n各动作置信度:")
-            for i, (gesture, conf) in enumerate(zip(GESTURE_NAMES, gesture_confidences)):
-                print(f"{gesture}: {conf:.4f}")
-            
+                     
             print(f"\n最大置信度动作: {max_gesture}")
             print(f"置信度: {max_confidence:.4f}")
             
@@ -111,69 +262,475 @@ class PredictionWorker(QObject):
     def stop(self):
         self.is_running = False
 
-
 class HandGestureApp(QMainWindow):
+    """
+    手势识别应用主窗口
+    """
+    # 添加信号用于更新UI
     update_result_signal = pyqtSignal(str)
     update_status_signal = pyqtSignal(str)
     update_motion_signal = pyqtSignal(str, float)
     update_action_signal = pyqtSignal(str, float)
-
+    send_frame_signal = pyqtSignal(np.ndarray)
+    
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("手势识别系统 (选定关键点)")
-        self.setGeometry(100, 100, 800, 600)
-        self.cap = None
-        self.is_recognizing = False
-        self.worker = None
-        self.worker_thread = None
-        # 使用预定义的GESTURE_NAMES
-        self.gesture_names = GESTURE_NAMES
-        self.init_ui()
-        self.init_mediapipe()
-        self.init_model()
-        self.init_data_buffer()
-        self.init_action_detection()
         
-        # 添加信号连接
-        self.update_status_signal.connect(self.update_status_display)
+        # 应用状态
+        self.camera_running = False
+        self.recognition_running = False
+        self.mouse_control_running = False
+        self.last_update_time = time.time()
+        self.frame_count = 0
+        self.fps = 0
+        
+        # 摄像头尺寸 - 初始化为默认值
+        self.camera_width = 640
+        self.camera_height = 480
+        
+        # 动作检测参数 - 从main1.py导入
+        self.action_started = False  # 动作开始标志
+        self.last_prediction = ""  # 上一次预测结果
+        self.confirmation_count = 0  # 确认计数器
+        self.current_gesture = "无动作"
+        
+        # 手势特定的阈值 - 优化检测灵敏度
+        self.gesture_thresholds = {
+            "right_swipe": {"motion": 0.08, "distance": 0.2, "stable_frames": 5},
+            "left_swipe": {"motion": 0.08, "distance": 0.2, "stable_frames": 5},
+            "up_swipe": {"motion": 0.08, "distance": 0.15, "stable_frames": 5},
+            "down_swipe": {"motion": 0.08, "distance": 0.15, "stable_frames": 5},
+            "click": {"motion": 0.06, "distance": 0.05, "stable_frames": 3},
+            "pinch": {"motion": 0.06, "distance": 0.05, "stable_frames": 3},
+            "ok_sign": {"motion": 0.06, "distance": 0.05, "stable_frames": 3},
+            "peace_sign": {"motion": 0.06, "distance": 0.05, "stable_frames": 3}
+        }
+        
+        # 动作检测参数
+        self.initial_position = None  # 初始位置
+        self.max_distance = 0  # 最大相对位移
+        self.motion_buffer = deque(maxlen=100)  # 运动量缓冲区
+        self.position_buffer = deque(maxlen=100)  # 位置缓冲区
+        self.stable_frames = 0  # 静止帧计数器
+        
+        # 使用默认阈值初始化
+        self.current_thresholds = self.gesture_thresholds["right_swipe"]
+        
+        # 序列数据缓冲区
+        self.sequence_length = SEQUENCE_LENGTH
+        self.data_buffer = deque(maxlen=self.sequence_length)
+        
+        # 显示控制 - 避免多线程更新UI
+        self.display_mutex = QMutex()
+        self.display_priority = "camera"  # camera/recognition/mouse
+        self.frame_update_timer = QTimer(self)
+        self.frame_update_timer.timeout.connect(self.update_frame_display)
+        self.frame_update_timer.setInterval(20)  # 50fps，提高帧率，从25ms改为20ms
+        
+        # 创建线程
+        self.camera_thread = CameraThread(camera_id=0)
+        self.gesture_recognition = GestureRecognition()
+        self.mouse_control = MouseControlThread()
+        
+        # 设置UI
+        self.init_ui()
+        
+        # 连接信号
+        self.connect_signals()
+        
+        # 添加连接从main1.py导入的信号
+        self.update_status_signal.connect(self.update_status)
         self.update_motion_signal.connect(self.update_motion_display)
         self.update_action_signal.connect(self.update_action_display)
+        self.update_result_signal.connect(self.update_result_display)
+        self.send_frame_signal.connect(self.handle_shared_frame)
         
-        # 尝试加载配置
-        self.load_landmark_config()
-
-    def load_landmark_config(self):
-        """尝试加载关键点配置"""
+        print("应用初始化完成")
+    
+    def init_ui(self):
+        """初始化用户界面"""
+        self.setWindowTitle("手势控制应用")
+        self.setGeometry(100, 100, 800, 600)
+        
+        # 创建主布局
+        main_layout = QVBoxLayout()
+        
+        # 创建显示区域 - 修改为自适应窗口大小
+        self.display_label = QLabel()
+        self.display_label.setAlignment(Qt.AlignCenter)
+        # 设置初始尺寸为摄像头尺寸，允许缩放
+        self.display_label.setMinimumSize(self.camera_width // 2, self.camera_height // 2)
+        self.display_label.setMaximumSize(self.camera_width * 2, self.camera_height * 2)
+        self.display_label.setSizePolicy(
+            QSizePolicy.Expanding, 
+            QSizePolicy.Expanding
+        )
+        self.display_label.setStyleSheet("border: 2px solid gray;")
+        main_layout.addWidget(self.display_label, 1)  # 添加拉伸因子
+        
+        # 创建状态标签
+        self.status_label = QLabel("就绪")
+        main_layout.addWidget(self.status_label)
+        
+        # 创建结果标签 - 从main1.py引入
+        self.result_label = QLabel("等待识别...", self)
+        self.result_label.setAlignment(Qt.AlignCenter)
+        self.result_label.setStyleSheet("font-size: 24px; color: red;")
+        main_layout.addWidget(self.result_label)
+        
+        # 添加加载状态标签 - 从main1.py引入
+        self.loading_label = QLabel("", self)
+        self.loading_label.setAlignment(Qt.AlignCenter)
+        self.loading_label.setStyleSheet("font-size: 18px; color: blue; font-weight: bold;")
+        main_layout.addWidget(self.loading_label)
+        
+        # 添加置信度标签 - 从main1.py引入
+        self.confidence_label = QLabel("置信度: -", self)
+        self.confidence_label.setAlignment(Qt.AlignLeft)
+        self.confidence_label.setStyleSheet("font-size: 16px; color: black;")
+        main_layout.addWidget(self.confidence_label)
+        
+        # 创建控制按钮组
+        button_layout = QHBoxLayout()
+        
+        # 摄像头ID输入
+        self.camera_id_input = QLineEdit("0")
+        self.camera_id_input.setPlaceholderText("摄像头ID")
+        self.camera_id_input.setFixedWidth(50)
+        button_layout.addWidget(self.camera_id_input)
+        
+        # 摄像头控制按钮
+        self.camera_button = QPushButton("启动摄像头")
+        self.camera_button.clicked.connect(self.toggle_camera)
+        button_layout.addWidget(self.camera_button)
+        
+        # 手势识别控制按钮
+        self.recognition_button = QPushButton("启动手势识别")
+        self.recognition_button.clicked.connect(self.toggle_recognition)
+        self.recognition_button.setEnabled(False)  # 初始禁用
+        button_layout.addWidget(self.recognition_button)
+        
+        # 鼠标控制按钮
+        self.mouse_control_button = QPushButton("启动鼠标控制")
+        self.mouse_control_button.clicked.connect(self.toggle_mouse_control)
+        self.mouse_control_button.setEnabled(False)  # 初始禁用
+        button_layout.addWidget(self.mouse_control_button)
+        
+        main_layout.addLayout(button_layout)
+        
+        # 同时运行复选框
+        self.simultaneous_checkbox = QCheckBox("同时运行手势识别和鼠标控制")
+        self.simultaneous_checkbox.setEnabled(False)  # 初始禁用
+        main_layout.addWidget(self.simultaneous_checkbox)
+        
+        # 显示控制选项
+        display_layout = QHBoxLayout()
+        display_layout.addWidget(QLabel("显示优先级: "))
+        
+        self.display_camera_radio = QRadioButton("摄像头")
+        self.display_camera_radio.setChecked(True)
+        self.display_camera_radio.toggled.connect(lambda: self.set_display_priority("camera"))
+        
+        self.display_recognition_radio = QRadioButton("手势识别")
+        self.display_recognition_radio.toggled.connect(lambda: self.set_display_priority("recognition"))
+        
+        self.display_mouse_radio = QRadioButton("鼠标控制")
+        self.display_mouse_radio.toggled.connect(lambda: self.set_display_priority("mouse"))
+        
+        display_layout.addWidget(self.display_camera_radio)
+        display_layout.addWidget(self.display_recognition_radio)
+        display_layout.addWidget(self.display_mouse_radio)
+        display_layout.addStretch()
+        
+        main_layout.addLayout(display_layout)
+        
+        # 创建中央部件
+        central_widget = QWidget()
+        central_widget.setLayout(main_layout)
+        self.setCentralWidget(central_widget)
+        
+        # 允许窗口大小调整时更新布局
+        self.setMinimumSize(640, 480)
+    
+    def set_display_priority(self, priority):
+        """设置显示优先级"""
+        self.display_mutex.lock()
+        self.display_priority = priority
+        self.display_mutex.unlock()
+    
+    def connect_signals(self):
+        """连接信号和槽"""
+        # 连接摄像头线程信号 - 改为间接连接，避免直接更新UI
+        self.camera_thread.raw_frame_signal.connect(self.process_raw_frame)
+        self.camera_thread.error_signal.connect(self.show_error)
+        self.camera_thread.camera_size_signal.connect(self.update_camera_size)
+        
+        # 连接手势识别信号
+        self.gesture_recognition.status_signal.connect(self.update_status)
+        self.gesture_recognition.gesture_signal.connect(self.process_gesture_result)
+        
+        # 连接鼠标控制信号
+        self.mouse_control.status_signal.connect(self.update_status)
+        self.mouse_control.frame_signal.connect(self.update_mouse_frame)
+    
+    def toggle_camera(self):
+        """切换摄像头状态"""
+        if not self.camera_running:
+            self.start_camera()
+        else:
+            self.stop_camera()
+    
+    def start_camera(self):
+        """启动摄像头"""
         try:
-            if os.path.exists('landmark_config.txt'):
-                with open('landmark_config.txt', 'r') as f:
-                    lines = f.readlines()
-                    for line in lines:
-                        if line.startswith('SELECTED_LANDMARKS'):
-                            # 这只是显示信息，实际SELECTED_LANDMARKS已在文件顶部定义
-                            print(f"加载关键点配置: {line.strip()}")
-                print("已加载关键点配置")
-        except Exception as e:
-            print(f"加载关键点配置时出错: {str(e)}")
-
-    def extract_landmarks(self, frame_data):
-        """从完整的帧数据中提取选定的关键点
-        
-        Args:
-            frame_data: 形状为 (21*3) 的原始数据，每3个值代表一个关键点的x,y,z坐标
+            camera_id = int(self.camera_id_input.text())
+            self.camera_thread.start_camera(camera_id)
+            self.camera_running = True
+            self.camera_button.setText("停止摄像头")
+            self.recognition_button.setEnabled(True)
+            self.mouse_control_button.setEnabled(True)
+            self.simultaneous_checkbox.setEnabled(True)
+            self.update_status("摄像头已启动")
             
-        Returns:
-            形状为 (len(SELECTED_LANDMARKS)*3) 的处理后数据
-        """
-        # 将数据重新整形为21x3
-        reshaped_data = np.array(frame_data).reshape(21, 3)
-        
-        # 提取选定的关键点
-        selected_data = reshaped_data[SELECTED_LANDMARKS, :]
-        
-        # 展平回一维数组
-        return selected_data.flatten().tolist()
+            # 启动帧更新定时器
+            self.frame_update_timer.start()
+        except Exception as e:
+            self.show_error(f"启动摄像头错误: {str(e)}")
+    
+    def stop_camera(self):
+        """停止摄像头"""
+        try:
+            # 先停止依赖摄像头的功能
+            if self.recognition_running:
+                self.stop_recognition()
+            
+            if self.mouse_control_running:
+                self.stop_mouse_control()
+            
+            # 停止帧更新定时器
+            self.frame_update_timer.stop()
+            
+            # 停止摄像头线程
+            self.camera_thread.stop_camera()
+            self.camera_running = False
+            
+            # 更新UI
+            self.camera_button.setText("启动摄像头")
+            self.recognition_button.setEnabled(False)
+            self.mouse_control_button.setEnabled(False)
+            self.simultaneous_checkbox.setEnabled(False)
+            self.display_label.clear()
+            self.update_status("摄像头已停止")
+        except Exception as e:
+            self.show_error(f"停止摄像头错误: {str(e)}")
 
+    def toggle_recognition(self):
+        """切换手势识别状态"""
+        if not self.recognition_running:
+            self.start_recognition()
+        else:
+            self.stop_recognition()
+
+    def start_recognition(self):
+        """启动手势识别"""
+        try:
+            # 如果设置了同时运行，则保持鼠标控制运行
+            # 否则，先停止鼠标控制
+            if not self.simultaneous_checkbox.isChecked() and self.mouse_control_running:
+                self.stop_mouse_control()
+            
+            # 启动手势识别
+            self.gesture_recognition.start_recognition()
+            self.recognition_running = True
+            self.recognition_button.setText("停止手势识别")
+            self.update_status("手势识别已启动")
+            
+            # 更新显示优先级
+            if not self.mouse_control_running:
+                self.display_recognition_radio.setChecked(True)
+        except Exception as e:
+            self.show_error(f"启动手势识别错误: {str(e)}")
+
+    def stop_recognition(self):
+        """停止手势识别"""
+        try:
+            self.gesture_recognition.stop_recognition()
+            self.recognition_running = False
+            self.recognition_button.setText("启动手势识别")
+            self.update_status("手势识别已停止")
+            
+            # 更新显示优先级
+            if self.mouse_control_running:
+                self.display_mouse_radio.setChecked(True)
+            else:
+                self.display_camera_radio.setChecked(True)
+        except Exception as e:
+            self.show_error(f"停止手势识别错误: {str(e)}")
+    
+    def toggle_mouse_control(self):
+        """切换鼠标控制状态"""
+        if not self.mouse_control_running:
+            self.start_mouse_control()
+        else:
+            self.stop_mouse_control()
+    
+    def start_mouse_control(self):
+        """启动鼠标控制"""
+        try:
+            # 如果设置了同时运行，则保持手势识别运行
+            # 否则，先停止手势识别
+            if not self.simultaneous_checkbox.isChecked() and self.recognition_running:
+                self.stop_recognition()
+            
+            # 启动鼠标控制
+            self.mouse_control.start_control()
+            self.mouse_control_running = True
+            self.mouse_control_button.setText("停止鼠标控制")
+            self.update_status("鼠标控制已启动")
+            
+            # 更新显示优先级
+            if not self.recognition_running:
+                self.display_mouse_radio.setChecked(True)
+        except Exception as e:
+            self.show_error(f"启动鼠标控制错误: {str(e)}")
+    
+    def stop_mouse_control(self):
+        """停止鼠标控制"""
+        try:
+            self.mouse_control.stop_control()
+            self.mouse_control_running = False
+            self.mouse_control_button.setText("启动鼠标控制")
+            self.update_status("鼠标控制已停止")
+            
+            # 更新显示优先级
+            if self.recognition_running:
+                self.display_recognition_radio.setChecked(True)
+            else:
+                self.display_camera_radio.setChecked(True)
+        except Exception as e:
+            self.show_error(f"停止鼠标控制错误: {str(e)}")
+    
+    def process_raw_frame(self, frame):
+        """处理原始帧 - 转发给需要的组件，添加动作检测逻辑"""
+        try:
+            # 计算FPS
+            current_time = time.time()
+            self.frame_count += 1
+            
+            # 每秒更新一次FPS
+            if current_time - self.last_update_time >= 1.0:
+                self.fps = self.frame_count
+                self.frame_count = 0
+                self.last_update_time = current_time
+            
+            # 为鼠标控制共享帧 - 使用直接方式传递帧，避免线程池导致的错误
+            if self.mouse_control_running:
+                # 创建帧的副本并直接传递
+                try:
+                    frame_for_mouse = frame.copy()
+                    self.send_frame_signal.emit(frame_for_mouse)
+                except Exception as e:
+                    print(f"帧传递错误: {str(e)}")
+            
+            # 手势识别处理
+            if self.recognition_running:
+                # 使用锁确保线程安全 - 减少处理负担和避免死锁
+                frame_copy = frame.copy()
+                
+                # 手部检测和手势识别处理
+                # MediaPipe手部检测
+                image_height, image_width, _ = frame_copy.shape
+                rgb_frame = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2RGB)
+                results = self.gesture_recognition.hands.process(rgb_frame)
+                
+                # 如果检测到手部，进行处理
+                if results.multi_hand_landmarks:
+                    for hand_landmarks in results.multi_hand_landmarks:
+                        # 绘制手部关键点
+                        self.gesture_recognition.mp_drawing.draw_landmarks(
+                            frame_copy,
+                            hand_landmarks,
+                            self.gesture_recognition.mp_hands.HAND_CONNECTIONS
+                        )
+                        
+                        # 从main1.py导入的手势处理逻辑
+                        # 处理关键点数据
+                        frame_data = self.process_landmarks(
+                            hand_landmarks,
+                            image_width,
+                            image_height
+                        )
+                        
+                        # 计算当前帧的运动量
+                        current_motion = self.calculate_motion(frame_data)
+                        self.motion_buffer.append(current_motion)
+                        self.position_buffer.append(frame_data)
+                        
+                        # 更新UI显示当前运动量 - 使用直接方式更新UI
+                        try:
+                            self.update_motion_signal.emit("运动量", current_motion)
+                        except Exception as e:
+                            print(f"UI更新错误: {str(e)}")
+                        
+                        # 动作检测逻辑
+                        if not self.action_started:
+                            if current_motion > self.current_thresholds["motion"]:
+                                self.action_started = True
+                                self.initial_position = self.calculate_relative_distance(frame_data)
+                                self.max_distance = 0
+                                self.data_buffer.clear()  # 清空之前的数据
+                                print(f"\n检测到动作开始 (运动量: {current_motion:.4f})")
+                                self.update_action_signal.emit("检测到动作开始", current_motion)
+                        
+                        if self.action_started:
+                            # 更新最大相对位移
+                            current_relative = self.calculate_relative_distance(frame_data)
+                            current_distance = np.linalg.norm(current_relative - self.initial_position)
+                            self.max_distance = max(self.max_distance, current_distance)
+                            
+                            # 更新UI显示当前动作状态
+                            self.update_action_signal.emit("动作进行中", self.max_distance)
+                            
+                            self.data_buffer.append(frame_data)
+                            
+                            # 检测动作结束
+                            if current_motion < self.current_thresholds["motion"]/2:
+                                self.stable_frames += 1
+                                if self.stable_frames >= self.current_thresholds["stable_frames"]:
+                                    # 检查动作完整性
+                                    if self.max_distance >= self.current_thresholds["distance"]:
+                                        self.action_started = False
+                                        self.stable_frames = 0
+                                        print(f"检测到动作结束 (最大相对位移: {self.max_distance:.4f})")
+                                        self.update_action_signal.emit("检测到动作结束", self.max_distance)
+                                        if len(self.data_buffer) >= 15:  # 至少收集15帧才进行预测
+                                            self.run_prediction()
+                                    else:
+                                        print(f"动作不完整，放弃预测 (最大相对位移: {self.max_distance:.4f})")
+                                        self.update_action_signal.emit("动作不完整，放弃预测", self.max_distance)
+                                        self.action_started = False
+                                        self.stable_frames = 0
+                                        self.data_buffer.clear()
+                            else:
+                                self.stable_frames = 0
+                else:
+                    # 如果没有检测到手，重置状态
+                    if self.action_started:
+                        self.action_started = False
+                        self.data_buffer.clear()
+                    
+                    self.update_motion_signal.emit("无手势", 0.0)
+                    self.update_action_signal.emit("等待手势", 0.0)
+                
+                # 将处理后的帧传递给手势识别模块 - 使用直接方式传递帧
+                try:
+                    self.gesture_recognition.process_shared_frame(frame_copy)
+                except Exception as e:
+                    print(f"帧处理错误: {str(e)}")
+            
+        except Exception as e:
+            self.show_error(f"处理帧错误: {str(e)}")
+    
     def process_landmarks(self, hand_landmarks, frame_width, frame_height):
         """处理手部关键点数据，添加标准化
         
@@ -195,7 +752,7 @@ class HandGestureApp(QMainWindow):
                 lm.z - root.z  # 相对Z坐标
             ])
         
-        # 数据标准化 - 与train.py中的preprocess_sequence保持一致
+        # 数据标准化
         frame_data = np.array(frame_data)
         frame_data = (frame_data - np.mean(frame_data)) / (np.std(frame_data) + 1e-8)
         
@@ -203,40 +760,34 @@ class HandGestureApp(QMainWindow):
         selected_frame_data = self.extract_landmarks(frame_data)
         
         return selected_frame_data
-
-    def init_action_detection(self):
-        """初始化动作检测相关参数"""
-        self.action_started = False  # 动作开始标志
-        self.last_prediction = ""  # 上一次预测结果
-        self.confirmation_count = 0  # 确认计数器
+    
+    def extract_landmarks(self, frame_data):
+        """从完整的帧数据中提取选定的关键点
         
-        # 手势特定的阈值
-        self.gesture_thresholds = {
-            "right_swipe": {"motion": 0.08, "distance": 0.2, "stable_frames": 5},
-            "left_swipe": {"motion": 0.08, "distance": 0.2, "stable_frames": 5},
-            "up_swipe": {"motion": 0.08, "distance": 0.15, "stable_frames": 5},
-            "down_swipe": {"motion": 0.08, "distance": 0.15, "stable_frames": 5},
-            "click": {"motion": 0.06, "distance": 0.05, "stable_frames": 3},
-            "pinch": {"motion": 0.06, "distance": 0.05, "stable_frames": 3}
-        }
+        Args:
+            frame_data: 形状为 (21*3) 的原始数据，每3个值代表一个关键点的x,y,z坐标
+            
+        Returns:
+            形状为 (len(SELECTED_LANDMARKS)*3) 的处理后数据
+        """
+        # 将数据重新整形为21x3
+        reshaped_data = np.array(frame_data).reshape(21, 3)
         
-        # 动作检测参数
-        self.initial_position = None  # 初始位置
-        self.max_distance = 0  # 最大相对位移
-        self.motion_buffer = deque(maxlen=100)  # 运动量缓冲区
-        self.position_buffer = deque(maxlen=100)  # 位置缓冲区
-        self.stable_frames = 0  # 静止帧计数器
+        # 提取选定的关键点
+        selected_data = reshaped_data[SELECTED_LANDMARKS, :]
         
-        # 使用默认阈值初始化
-        self.current_thresholds = self.gesture_thresholds["right_swipe"]
-        print("动作检测参数初始化完成")
-
-    def init_data_buffer(self):
-        """初始化数据缓冲区"""
-        self.sequence_length = SEQUENCE_LENGTH  # 使用全局常量
-        self.data_buffer = deque(maxlen=self.sequence_length)
-        self.current_gesture = "无动作"
-
+        # 展平回一维数组
+        return selected_data.flatten().tolist()
+    
+    def calculate_motion(self, current_data):
+        """计算最近两帧之间的运动量"""
+        if len(self.position_buffer) < 2:
+            return 0
+        prev_data = np.array(self.position_buffer[-2])
+        curr_data = np.array(current_data)
+        motion = np.mean(np.abs(curr_data - prev_data))
+        return motion
+    
     def calculate_relative_distance(self, frame_data):
         """计算指尖相对于掌根的位移
         
@@ -260,515 +811,372 @@ class HandGestureApp(QMainWindow):
         
         # 计算加权平均
         return 0.5 * index_finger + 0.25 * middle_finger + 0.25 * ring_finger
-
-    def calculate_motion(self, current_data):
-        """计算最近两帧之间的运动量"""
-        if len(self.position_buffer) < 2:
-            return 0
-        prev_data = np.array(self.position_buffer[-2])
-        curr_data = np.array(current_data)
-        motion = np.mean(np.abs(curr_data - prev_data))
-        return motion
-
-    def load_gesture_names(self):
-        """加载手势名称
-        
-        由于我们已经预定义了GESTURE_NAMES，此方法仅作为备用
-        """
-        # 直接返回预定义的手势名称
-        return GESTURE_NAMES
-        
-        # 以下代码保留作为备用，以防需要从目录中读取
-        # data_dir = "gesture_data"
-        # return sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
-
-    def init_ui(self):
-        # 界面组件
-        self.camera_id_input = QLineEdit(self)
-        self.camera_id_input.setPlaceholderText("输入摄像头 ID")
-        self.camera_id_input.setText("0")
-
-        self.start_stop_button = QPushButton("开始识别", self)
-        self.start_stop_button.clicked.connect(self.toggle_recognition)
-
-        self.test_button = QPushButton("测试模型", self)
-        self.test_button.clicked.connect(self.test_model)
-
-        self.preview_label = QLabel(self)
-        self.preview_label.setFixedSize(640, 480)
-        self.preview_label.setStyleSheet("background-color: black;")
-
-        self.result_label = QLabel("等待识别...", self)
-        self.result_label.setAlignment(Qt.AlignCenter)
-        self.result_label.setStyleSheet("font-size: 24px; color: red;")
-
-        # 添加状态信息面板
-        self.status_label = QLabel("状态: 未开始", self)
-        self.status_label.setAlignment(Qt.AlignLeft)
-        self.status_label.setStyleSheet("font-size: 16px; color: black;")
-        
-        self.threshold_label = QLabel("阈值信息: 未设置", self)
-        self.threshold_label.setAlignment(Qt.AlignLeft)
-        self.threshold_label.setStyleSheet("font-size: 16px; color: black;")
-        
-        self.confidence_label = QLabel("置信度: -", self)
-        self.confidence_label.setAlignment(Qt.AlignLeft)
-        self.confidence_label.setStyleSheet("font-size: 16px; color: black;")
-        
-        # 添加加载状态标签
-        self.loading_label = QLabel("", self)
-        self.loading_label.setAlignment(Qt.AlignCenter)
-        self.loading_label.setStyleSheet("font-size: 18px; color: blue; font-weight: bold;")
-
-        # 布局
-        control_layout = QHBoxLayout()
-        control_layout.addWidget(self.camera_id_input)
-        control_layout.addWidget(self.start_stop_button)
-        control_layout.addWidget(self.test_button)
-
-        # 状态信息布局
-        status_layout = QVBoxLayout()
-        status_layout.addWidget(self.status_label)
-        status_layout.addWidget(self.threshold_label)
-        status_layout.addWidget(self.confidence_label)
-        
-        # 将状态信息容器添加到一个水平布局
-        info_container = QWidget()
-        info_container.setLayout(status_layout)
-        info_container.setFixedWidth(300)
-        
-        # 加载状态单独放在顶部
-        loading_layout = QHBoxLayout()
-        loading_layout.addWidget(self.loading_label)
-
-        bottom_layout = QHBoxLayout()
-        bottom_layout.addWidget(self.result_label, 2)
-        bottom_layout.addWidget(info_container, 1)
-
-        main_layout = QVBoxLayout()
-        main_layout.addLayout(control_layout)
-        main_layout.addLayout(loading_layout)
-        main_layout.addWidget(self.preview_label)
-        main_layout.addLayout(bottom_layout)
-
-        container = QWidget()
-        container.setLayout(main_layout)
-        self.setCentralWidget(container)
-
-        # 初始化定时器
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_frame)
-        self.update_result_signal.connect(self.update_result_display)
-
-    def init_mediapipe(self):
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.5,
-            model_complexity=0  
-        )
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_drawing_styles = mp.solutions.drawing_styles
-
-    def init_model(self):
-        try:
-            # 尝试先加载选定关键点的模型
-            model_path = "saved_model_selected_landmarks"
-            if not os.path.exists(model_path):
-                model_path = "saved_model"  # 回退到原始模型
-                print(f"警告: 找不到选定关键点的模型，尝试加载原始模型 {model_path}")
-            
-            if not os.path.exists(model_path):
-                print(f"错误：找不到模型文件夹 {model_path}")
-                self.result_label.setText("错误：找不到模型文件夹")
-                self.model = None
-                return
-            
-            print(f"正在加载模型 {model_path}...")
-            print(f"TensorFlow版本: {tf.version.VERSION}")
-            print(f"Keras版本: {tf.keras.__version__}")
-            
-            # 加载SavedModel格式的模型
-            try:
-                self.model = tf.keras.models.load_model(model_path)
-                print("模型加载成功")
-                print(f"使用关键点IDs: {SELECTED_LANDMARKS}")
-                print(f"输入维度: {INPUT_DIM}")
-                print(f"序列长度: {SEQUENCE_LENGTH}")
-            except Exception as e:
-                print(f"模型加载失败: {str(e)}")
-                self.result_label.setText("模型加载失败")
-                self.model = None
-                return
-            
-            # 编译模型 - 与train.py中build_model使用的配置保持一致
-            self.model.compile(
-                optimizer='adam',
-                loss='categorical_crossentropy',
-                metrics=['accuracy']
-            )
-            print("模型编译成功")
-            print(f"模型输入形状: {self.model.input_shape}")
-            print(f"模型输出形状: {self.model.output_shape}")
-            
-        except Exception as e:
-            print(f"模型加载失败: {str(e)}")
-            print(f"TensorFlow版本: {tf.version.VERSION}")
-            print(f"Keras版本: {tf.keras.__version__}")
-            self.result_label.setText("模型加载失败")
-            self.model = None
-
-    def toggle_recognition(self):
-        if not hasattr(self, 'is_recognizing') or not self.is_recognizing:
-            self.start_recognition()
-        else:
-            self.stop_recognition()
-
-    def start_recognition(self):
-        if self.model is None:
-            self.result_label.setText("模型未加载")
-            return
-
-        camera_id = int(self.camera_id_input.text())
-        self.cap = cv2.VideoCapture(camera_id)
-
-        if not self.cap.isOpened():
-            self.result_label.setText("摄像头错误")
-            return
-
-        self.is_recognizing = True
-        self.start_stop_button.setText("停止识别")
-        self.timer.start(30)  # ~33fps
-        self.data_buffer.clear()
-        self.result_label.setText("准备识别...")
-
-    def stop_recognition(self):
-        self.is_recognizing = False
-        self.start_stop_button.setText("开始识别")
-        self.timer.stop()
-        
-        # 停止预测线程
-        if self.worker is not None:
-            self.worker.stop()
-        if self.worker_thread is not None:
-            self.worker_thread.quit()
-            if not self.worker_thread.wait(1000):
-                self.worker_thread.terminate()
-            self.worker_thread = None
-        self.worker = None
-            
-        if self.cap:
-            self.cap.release()
-        self.preview_label.clear()
-        self.result_label.setText("识别已停止")
-        self.preview_label.setStyleSheet("background-color: black;")
-
-    def update_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            return
-
-        # 镜像处理
-        frame = cv2.flip(frame, 1)
-        
-        # 获取图像尺寸
-        image_height, image_width, _ = frame.shape
-        
-        # 转换为RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # 手部检测
-        results = self.hands.process(rgb_frame)
-        hand_detected = False
-
-        if results.multi_hand_landmarks:
-            hand_detected = True
-            for hand_landmarks in results.multi_hand_landmarks:
-                # 绘制骨架
-                self.mp_drawing.draw_landmarks(
-                    frame,
-                    hand_landmarks,
-                    self.mp_hands.HAND_CONNECTIONS,
-                    self.mp_drawing_styles.get_default_hand_landmarks_style(),
-                    self.mp_drawing_styles.get_default_hand_connections_style()
-                )
-
-                # 处理数据
-                frame_data = self.process_landmarks(
-                    hand_landmarks,
-                    image_width,
-                    image_height
-                )
-                
-                # 计算当前帧的运动量
-                current_motion = self.calculate_motion(frame_data)
-                self.motion_buffer.append(current_motion)
-                self.position_buffer.append(frame_data)
-                
-                # 更新UI显示当前运动量
-                self.update_motion_signal.emit("运动量", current_motion)
-                
-                # 计算相对位移
-                if not self.action_started:
-                    if current_motion > self.current_thresholds["motion"]:
-                        self.action_started = True
-                        self.initial_position = self.calculate_relative_distance(frame_data)
-                        self.max_distance = 0
-                        self.data_buffer.clear()  # 清空之前的数据
-                        print(f"\n检测到动作开始 (运动量: {current_motion:.4f})")
-                        self.update_action_signal.emit("检测到动作开始", current_motion)
-                
-                if self.action_started:
-                    # 更新最大相对位移
-                    current_relative = self.calculate_relative_distance(frame_data)
-                    current_distance = np.linalg.norm(current_relative - self.initial_position)
-                    self.max_distance = max(self.max_distance, current_distance)
-                    
-                    # 更新UI显示当前动作状态
-                    self.update_action_signal.emit("动作进行中", self.max_distance)
-                    
-                    self.data_buffer.append(frame_data)
-                    
-                    # 检测动作结束
-                    if current_motion < self.current_thresholds["motion"]/2:
-                        self.stable_frames += 1
-                        if self.stable_frames >= self.current_thresholds["stable_frames"]:
-                            # 检查动作完整性
-                            if self.max_distance >= self.current_thresholds["distance"]:
-                                self.action_started = False
-                                self.stable_frames = 0
-                                print(f"检测到动作结束 (最大相对位移: {self.max_distance:.4f})")
-                                self.update_action_signal.emit("检测到动作结束", self.max_distance)
-                                if len(self.data_buffer) >= 15:  # 至少收集15帧才进行预测
-                                    print(f"开始预测 (收集帧数: {len(self.data_buffer)})")
-                                    self.update_action_signal.emit(f"开始预测 (帧数: {len(self.data_buffer)})", self.max_distance)
-                                    self.run_prediction()
-                            else:
-                                print(f"动作不完整，放弃预测 (最大相对位移: {self.max_distance:.4f})")
-                                self.update_action_signal.emit("动作不完整，放弃预测", self.max_distance)
-                                self.action_started = False
-                                self.stable_frames = 0
-                                self.data_buffer.clear()
-                    else:
-                        self.stable_frames = 0
-        else:
-            if self.action_started:
-                self.action_started = False
-                self.data_buffer.clear()
-            # 只有在未进行预测时才更新为无动作
-            if not self.worker_thread or not self.worker_thread.isRunning():
-                # 保留之前的预测结果，除非没有检测到手
-                if not hasattr(self, 'current_gesture') or self.current_gesture == "无动作":
-                    self.update_result_signal.emit("无动作")
-            self.update_motion_signal.emit("无手势", 0.0)
-            self.update_action_signal.emit("等待手势", 0.0)
-
-        # 更新预览画面
-        preview_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, c = preview_frame.shape
-        q_img = QImage(preview_frame.data, w, h, w * c, QImage.Format_RGB888)
-        self.preview_label.setPixmap(QPixmap.fromImage(q_img))
-
-    def update_status_display(self, status_text):
-        """更新加载状态显示"""
-        self.loading_label.setText(status_text)
-        # 确保UI立即更新
-        QApplication.processEvents()
-        
-    def update_motion_display(self, text, value):
-        """更新动作状态显示"""
-        self.status_label.setText(f"状态: {text} ({value:.4f})")
-        # 确保UI立即更新
-        QApplication.processEvents()
-        
-    def update_action_display(self, text, value):
-        """更新动作进度显示"""
-        self.loading_label.setText(f"{text} - 最大位移: {value:.4f}")
-        # 确保UI立即更新
-        QApplication.processEvents()
-        
+    
     def run_prediction(self):
+        """运行预测逻辑"""
         try:
             # 显示加载状态
             self.update_status_signal.emit("正在准备数据...")
             
             # 动态填充/截断序列
-            sequence = np.array(self.data_buffer)
+            sequence = np.array(list(self.data_buffer))
             if len(sequence) < self.sequence_length:
-                # 重复最后一帧填充不足部分 - 与train.py中load_dataset保持一致
+                # 重复最后一帧填充不足部分
                 last_frame = sequence[-1]
                 pad_frames = np.tile(last_frame, (self.sequence_length-len(sequence), 1))
                 sequence = np.concatenate([sequence, pad_frames])
             else:
                 sequence = sequence[-self.sequence_length:]  # 取最后30帧
-
-            # 如果已有正在运行的线程，先停止它
-            if self.worker is not None:
-                self.worker.stop()
-            if self.worker_thread is not None and self.worker_thread.isRunning():
-                self.worker_thread.quit()
-                self.worker_thread.wait(1000)  # 等待最多1秒
-
-            # 更新UI状态
-            self.update_status_signal.emit("初始化预测线程...")
-            QApplication.processEvents()
-
-            # 创建新的预测线程
-            self.worker = PredictionWorker(self.model, sequence)
-            self.worker_thread = QThread()
-
-            # 设置连接
-            self.worker.moveToThread(self.worker_thread)
-            self.worker_thread.started.connect(self.worker.predict)
-            self.worker.result_ready.connect(self.handle_prediction_result)
-            self.worker.status_update.connect(self.update_status_signal.emit)
-            self.worker.finished.connect(lambda: self.cleanup_thread())
-
-            # 启动线程
-            self.worker_thread.start()
             
+            # 准备预测
+            self.update_status_signal.emit("开始预测...")
+            print(f"\n开始预测 (收集帧数: {len(self.data_buffer)})")
+            
+            # 将序列传递给手势识别模块进行预测
+            self.gesture_recognition.predict_gesture(sequence)
         except Exception as e:
-            print(f"创建预测线程时出错: {str(e)}")
+            print(f"创建预测时出错: {str(e)}")
             self.update_status_signal.emit(f"预测错误: {str(e)}")
-
-    def cleanup_thread(self):
+    
+    def process_gesture_result(self, gesture, confidence):
+        """处理手势识别结果"""
         try:
-            # 清理完成后更新状态
-            self.update_status_signal.emit("预测完成")
+            # 确保UI更新在主线程中执行
+            QApplication.processEvents()
             
-            if self.worker_thread is not None:
-                self.worker_thread.quit()
-                if not self.worker_thread.wait(1000):
-                    self.worker_thread.terminate()
-                self.worker_thread = None
-            self.worker = None
+            # 更新置信度显示
+            self.confidence_label.setText(f"置信度: {confidence:.4f}")
             
-            # 短暂延迟后清除加载状态
-            QTimer.singleShot(2000, lambda: self.update_status_signal.emit(""))
+            # 更新当前手势的阈值
+            if gesture in self.gesture_thresholds:
+                self.current_thresholds = self.gesture_thresholds[gesture]
+                print(f"更新阈值: {gesture}")
+                print(f"运动量阈值: {self.current_thresholds['motion']}")
+                print(f"位移阈值: {self.current_thresholds['distance']}")
+                print(f"静止帧阈值: {self.current_thresholds['stable_frames']}")
             
+            # 直接更新结果显示
+            if confidence > 0.2:  # 置信度阈值
+                self.update_result_signal.emit(gesture)
+                self.current_gesture = gesture
+                self.last_prediction = gesture
+                self.confirmation_count = 1
+                # 立即更新可能的手势
+                self.update_motion_signal.emit(f"检测到: {gesture}", confidence)
+            else:
+                self.update_result_signal.emit("无动作")
+                self.update_motion_signal.emit("置信度过低", confidence)
+            
+            # 如果鼠标控制正在运行，将手势结果传递给它
+            if self.mouse_control_running and hasattr(self.mouse_control, 'process_gesture'):
+                self.mouse_control.process_gesture(gesture, confidence)
+                
+            # 确保UI立即更新
+            QApplication.processEvents()
         except Exception as e:
-            print(f"清理线程时出错: {str(e)}")
-
-    def handle_prediction_result(self, result, confidence):
-        # 确保UI更新在主线程中执行
-        QApplication.processEvents()
-        
-        # 更新置信度显示
-        self.confidence_label.setText(f"置信度: {confidence:.4f}")
-        
-        # 更新当前手势的阈值
-        if result in self.gesture_thresholds:
-            self.current_thresholds = self.gesture_thresholds[result]
-            print(f"更新阈值: {result}")
-            print(f"运动量阈值: {self.current_thresholds['motion']}")
-            print(f"位移阈值: {self.current_thresholds['distance']}")
-            print(f"静止帧阈值: {self.current_thresholds['stable_frames']}")
-            
-            # 更新UI上的阈值信息
-            thresh_info = (
-                f"运动量阈值: {self.current_thresholds['motion']:.4f}\n"
-                f"位移阈值: {self.current_thresholds['distance']:.4f}\n"
-                f"静止帧阈值: {self.current_thresholds['stable_frames']}"
-            )
-            self.threshold_label.setText(thresh_info)
-            
-            # 立即更新状态显示
-            self.update_motion_signal.emit(f"识别到: {result}", confidence)
-        
-        # 直接更新结果显示，不再使用无动作过滤
-        if confidence > 0.2:  # 使用与PredictionWorker相同的阈值
-            self.update_result_signal.emit(result)
-            self.current_gesture = result
-            self.last_prediction = result
-            self.confirmation_count = 1
-            # 立即更新可能的手势
-            self.update_motion_signal.emit(f"检测到: {result}", confidence)
-        else:
-            self.update_result_signal.emit("无动作")
-            self.update_motion_signal.emit("置信度过低", confidence)
-        
-        # 确保UI立即更新
-        QApplication.processEvents()
-
-    def update_result_display(self, text):
-        self.result_label.setText(text)
-        # 根据结果改变颜色
-        color = "green" if text != "无动作" else "red"
-        self.result_label.setStyleSheet(f"font-size: 24px; color: {color};")
-        
-        # 确保UI立即更新
-        QApplication.processEvents()
-
-    def test_model(self):
-        """测试模型功能"""
-        if self.model is None:
-            QMessageBox.warning(self, "警告", "模型未加载，请先加载模型")
-            return
-
+            self.show_error(f"处理手势结果错误: {str(e)}")
+    
+    def update_motion_display(self, text, value):
+        """更新动作状态显示"""
         try:
-            # 加载测试数据
-            test_data_path = "test_data.npy"
-            if not os.path.exists(test_data_path):
-                QMessageBox.warning(self, "警告", f"找不到测试数据文件 {test_data_path}")
+            self.status_label.setText(f"状态: {text} ({value:.4f})")
+            # 确保UI立即更新，但不阻塞处理
+            QApplication.processEvents()
+        except Exception as e:
+            print(f"更新动作状态显示出错: {str(e)}")
+        
+    def update_action_display(self, text, value):
+        """更新动作进度显示"""
+        try:
+            self.loading_label.setText(f"{text} - 最大位移: {value:.4f}")
+            # 确保UI立即更新，但不阻塞处理
+            QApplication.processEvents()
+        except Exception as e:
+            print(f"更新动作进度显示出错: {str(e)}")
+    
+    def update_result_display(self, text):
+        """更新结果显示"""
+        try:
+            self.result_label.setText(text)
+            # 根据结果改变颜色
+            color = "green" if text != "无动作" else "red"
+            self.result_label.setStyleSheet(f"font-size: 24px; color: {color};")
+            
+            # 确保UI立即更新，但不阻塞处理
+            QApplication.processEvents()
+        except Exception as e:
+            print(f"更新结果显示出错: {str(e)}")
+    
+    def update_mouse_frame(self, frame):
+        """更新鼠标控制模式的帧显示"""
+        if self.display_priority == "mouse":
+            # 确保鼠标控制模式下的帧更新是线程安全的
+            try:
+                h, w, c = frame.shape
+                # 先转换为QImage，再创建QPixmap
+                q_img = QImage(frame.data, w, h, w * c, QImage.Format_RGB888).rgbSwapped()
+                pixmap = QPixmap.fromImage(q_img)
+                
+                # 获取显示标签的当前大小
+                label_size = self.display_label.size()
+                
+                # 计算保持宽高比的缩放后尺寸
+                scaled_pixmap = pixmap.scaled(
+                    label_size, 
+                    Qt.KeepAspectRatio,  # 保持原始宽高比
+                    Qt.SmoothTransformation  # 使用平滑变换提高质量
+                )
+                
+                # 更新显示标签
+                self.display_label.setPixmap(scaled_pixmap)
+            except Exception as e:
+                print(f"更新鼠标控制帧错误: {str(e)}")
+
+    def handle_shared_frame(self, frame):
+        """处理从手势识别共享的帧"""
+        # 确保鼠标控制线程正在运行且处于共享模式
+        if self.mouse_control_running and hasattr(self.mouse_control, 'process_shared_frame'):
+            try:
+                # 将帧传递给鼠标控制线程处理
+                self.mouse_control.process_shared_frame(frame)
+            except Exception as e:
+                print(f"共享帧错误: {str(e)}")
+    
+    def update_frame_display(self):
+        """定时更新帧显示 - 避免多线程频繁更新导致的UI闪烁"""
+        try:
+            # 使用锁控制帧选择
+            self.display_mutex.lock()
+            priority = self.display_priority
+            self.display_mutex.unlock()
+            
+            frame = None
+            
+            if priority == "recognition" and self.recognition_running:
+                # 获取手势识别处理后的帧
+                frame = self.gesture_recognition.get_latest_frame()
+            elif priority == "mouse" and self.mouse_control_running:
+                # 获取鼠标控制处理后的帧
+                frame = self.mouse_control.get_latest_frame()
+            else:
+                # 获取摄像头处理后的帧
+                frame = self.camera_thread.get_latest_processed_frame()
+            
+            # 如果没有可用帧，退出
+            if frame is None:
                 return
                 
-            test_data = np.load(test_data_path)
-            
-            # 检查是否需要提取关键点
-            if test_data.shape[1] > INPUT_DIM:
-                # 假设数据是完整的21个关键点，需要提取
-                print("提取测试数据的选定关键点...")
-                # 重塑为(帧数, 21, 3)以便处理
-                frames = test_data.shape[0]
-                reshaped_data = test_data.reshape(frames, 21, 3)
-                # 提取选定关键点
-                test_data = reshaped_data[:, SELECTED_LANDMARKS, :].reshape(frames, -1)
-                print(f"提取后的测试数据形状: {test_data.shape}")
-            
-            if test_data.shape[0] < SEQUENCE_LENGTH:
-                QMessageBox.warning(self, "警告", f"测试数据不足{SEQUENCE_LENGTH}帧，当前帧数: {test_data.shape[0]}")
-                # 尝试填充数据
-                last_frame = test_data[-1]
-                pad_frames = np.tile(last_frame, (SEQUENCE_LENGTH - test_data.shape[0], 1))
-                test_data = np.concatenate([test_data, pad_frames])
-                print(f"已填充测试数据至{SEQUENCE_LENGTH}帧")
+            # 使用PIL处理中文显示
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                import numpy as np
                 
-            elif test_data.shape[0] > SEQUENCE_LENGTH:
-                # 截断为需要的帧数
-                test_data = test_data[:SEQUENCE_LENGTH]
-                print(f"已截断测试数据至{SEQUENCE_LENGTH}帧")
-
-            # 进行预测
-            input_data = np.expand_dims(test_data, axis=0)
-            print(f"输入数据形状: {input_data.shape}")
+                # 转换为PIL图像以支持中文
+                pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(pil_img)
+                
+                # 尝试加载中文字体
+                try:
+                    # 增加更多可能的字体路径选择
+                    font_candidates = [
+                        os.path.join(os.getenv('SystemRoot', 'C:\\Windows'), 'Fonts', 'simhei.ttf'),
+                        os.path.join(os.getenv('SystemRoot', 'C:\\Windows'), 'Fonts', 'msyh.ttf'),
+                        os.path.join(os.getenv('SystemRoot', 'C:\\Windows'), 'Fonts', 'simsun.ttc'),
+                        os.path.join(os.getenv('SystemRoot', 'C:\\Windows'), 'Fonts', 'arialuni.ttf'),
+                        'simhei.ttf',
+                        'msyh.ttf',
+                        'simsun.ttc'
+                    ]
+                    
+                    font_found = False
+                    for font_path in font_candidates:
+                        if os.path.exists(font_path):
+                            try:
+                                fps_font = ImageFont.truetype(font_path, 24)
+                                mode_font = ImageFont.truetype(font_path, 20)
+                                font_found = True
+                                break
+                            except Exception:
+                                continue
+                            
+                    if not font_found:
+                        fps_font = ImageFont.load_default()
+                        mode_font = ImageFont.load_default()
+                except Exception:
+                    fps_font = ImageFont.load_default()
+                    mode_font = ImageFont.load_default()
+                
+                # 添加FPS显示
+                draw.text((10, 30), f"FPS: {self.fps}", font=fps_font, fill=(0, 255, 0))
+                
+                # 添加模式显示
+                status_text = ""
+                if self.recognition_running and self.mouse_control_running:
+                    status_text = "模式: 手势识别 + 鼠标控制"
+                elif self.recognition_running:
+                    status_text = "模式: 手势识别"
+                elif self.mouse_control_running:
+                    status_text = "模式: 鼠标控制"
+                else:
+                    status_text = "模式: 仅摄像头"
+                
+                draw.text((10, 60), status_text, font=mode_font, fill=(255, 255, 0))
+                
+                # 转换回OpenCV格式
+                frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                
+            except ImportError:
+                # 如果PIL不可用，回退到OpenCV文本渲染
+                cv2.putText(
+                    frame, 
+                    f"FPS: {self.fps}", 
+                    (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    1, 
+                    (0, 255, 0), 
+                    2
+                )
+                
+                # 添加模式显示
+                status_text = ""
+                if self.recognition_running and self.mouse_control_running:
+                    status_text = "Mode: Gesture + Mouse"
+                elif self.recognition_running:
+                    status_text = "Mode: Gesture Recognition"
+                elif self.mouse_control_running:
+                    status_text = "Mode: Mouse Control"
+                else:
+                    status_text = "Mode: Camera Only"
+                
+                cv2.putText(
+                    frame, 
+                    status_text, 
+                    (10, 60), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.7, 
+                    (255, 255, 0), 
+                    2
+                )
             
-            pred = self.model.predict(input_data, verbose=0)
+            # 转换帧到QPixmap并显示
+            height, width, channel = frame.shape
+            bytes_per_line = 3 * width
             
-            # 详细输出所有手势的置信度
-            detailed_result = "各手势置信度:\n"
-            for i, (gesture, conf) in enumerate(zip(GESTURE_NAMES, pred[0])):
-                detailed_result += f"{gesture}: {conf:.4f}\n"
-            
-            gesture_idx = np.argmax(pred)
-            confidence = pred[0][gesture_idx]
-            
-            result = f"预测结果: {GESTURE_NAMES[gesture_idx]}\n置信度: {confidence:.2%}\n\n{detailed_result}"
-            QMessageBox.information(self, "测试结果", result)
-            
+            # 使用锁确保QImage创建和显示过程不被中断
+            try:
+                # 创建QImage
+                q_img = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888).rgbSwapped()
+                pixmap = QPixmap.fromImage(q_img)
+                
+                # 获取显示标签的当前大小
+                label_size = self.display_label.size()
+                
+                # 计算保持宽高比的缩放后尺寸
+                scaled_pixmap = pixmap.scaled(
+                    label_size, 
+                    Qt.KeepAspectRatio,  # 保持原始宽高比
+                    Qt.SmoothTransformation  # 使用平滑变换提高质量
+                )
+                
+                # 更新显示标签
+                self.display_label.setPixmap(scaled_pixmap)
+                
+                # 居中显示图像
+                self.display_label.setAlignment(Qt.AlignCenter)
+            except Exception as e:
+                print(f"更新图像显示出错: {str(e)}")
+                
         except Exception as e:
-            import traceback
-            error_details = traceback.format_exc()
-            QMessageBox.critical(self, "错误", f"测试过程中出错: {str(e)}\n\n{error_details}")
-
+            if "get_latest_frame" in str(e):
+                # 忽略特定错误，等待下一次更新
+                pass
+            else:
+                self.show_error(f"更新显示错误: {str(e)}")
+    
+    def update_status(self, message):
+        """更新状态栏消息"""
+        self.status_label.setText(message)
+    
+    def show_error(self, error_message):
+        """显示错误消息"""
+        print(f"错误: {error_message}")
+        self.update_status(f"错误: {error_message}")
+    
     def closeEvent(self, event):
-        self.stop_recognition()
-        event.accept()
+        """关闭窗口事件处理"""
+        try:
+            print("正在关闭应用...")
+            # 停止各个线程
+            if self.camera_thread is not None:
+                self.stop_camera()
+                try:
+                    # 等待最多0.5秒以确保线程停止
+                    self.camera_thread.wait(500)
+                except Exception as e:
+                    print(f"等待摄像头线程停止时出错: {str(e)}")
+            
+            if self.gesture_recognition is not None:
+                self.stop_recognition()
+                try:
+                    # 等待最多0.5秒以确保线程停止
+                    self.gesture_recognition.wait(500)
+                except Exception as e:
+                    print(f"等待手势识别线程停止时出错: {str(e)}")
+            
+            if self.mouse_control is not None:
+                self.stop_mouse_control()
+                try:
+                    # 等待最多0.5秒以确保线程停止
+                    self.mouse_control.wait(500)
+                except Exception as e:
+                    print(f"等待鼠标控制线程停止时出错: {str(e)}")
+                    
+            # 等待一小段时间确保所有资源都被清理
+            time.sleep(0.2)
+            
+            # 保存设置
+            self.save_settings()
+            
+            print("应用已安全关闭")
+            event.accept()
+        except Exception as e:
+            print(f"关闭应用时出错: {str(e)}")
+            event.accept()
 
-    def __del__(self):
-        self.stop_recognition()
+    def resizeEvent(self, event: QResizeEvent):
+        """处理窗口大小变化事件"""
+        # 调用父类的resize事件处理
+        super().resizeEvent(event)
+        
+        # 立即更新预览图像以适应新的窗口大小
+        self.update_frame_display()
+        
+        # 记录窗口大小变化
+        old_size = event.oldSize()
+        new_size = event.size()
+        if old_size.width() > 0 and old_size.height() > 0:  # 避免初始化时的无效事件
+            print(f"窗口大小从 {old_size.width()}x{old_size.height()} 变为 {new_size.width()}x{new_size.height()}")
 
+    def save_settings(self):
+        """保存应用设置"""
+        try:
+            print("保存应用设置...")
+            # 这里可以添加设置保存代码，如果需要
+            # 例如保存摄像头ID、显示优先级等设置
+        except Exception as e:
+            print(f"保存设置出错: {str(e)}")
+
+    def update_camera_size(self, width, height):
+        """更新摄像头尺寸和UI显示区域"""
+        self.camera_width = width
+        self.camera_height = height
+        
+        # 根据摄像头实际尺寸调整显示区域大小
+        self.display_label.setMinimumSize(width // 2, height // 2)
+        self.display_label.setMaximumSize(width * 2, height * 2)
+        
+        # 更新状态
+        self.update_status(f"摄像头分辨率: {width}x{height}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
