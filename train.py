@@ -17,6 +17,13 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 
+# 导入 GPU 配置
+from temp.gpu_config import configure_gpu
+
+# 配置 GPU
+if not configure_gpu():
+    print("警告：GPU 配置失败，将使用 CPU 进行训练")
+
 # 设置中文显示
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
 plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
@@ -34,7 +41,7 @@ VAL_SPLIT = 0.2  # 验证集比例
 RANDOM_SEED = 42  # 随机种子，确保结果可复现
 
 # 提前定义手势名称列表，确保顺序一致
-GESTURE_NAMES = ["right_swipe", "left_swipe", "up_swipe", "down_swipe", "click", "pinch"]
+GESTURE_NAMES = ["right_swipe", "left_swipe", "up_swipe", "down_swipe", "click", "pinch", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
 
 # 设置随机种子，确保结果可复现
 np.random.seed(RANDOM_SEED)
@@ -133,7 +140,7 @@ def analyze_landmarks_importance(X, y):
     plt.ylabel('手势类别')
     
     plt.tight_layout()
-    plt.savefig('landmark_importance_analysis.png')
+    plt.savefig('result/landmark_importance_analysis.png')
     plt.close()
     print("关键点重要性分析已保存到 'landmark_importance_analysis.png'")
 
@@ -428,11 +435,11 @@ def plot_training_history(history):
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig('training_history.png')
+    plt.savefig('result/training_history.png')
     plt.close()
     
     # 保存训练历史数据
-    np.save('training_history.npy', history.history)
+    np.save('result/training_history.npy', history.history)
     print("训练历史已保存到 'training_history.png'")
 
 def calculate_confusion_matrix(model, X_test, y_test, gesture_names):
@@ -467,7 +474,7 @@ def calculate_confusion_matrix(model, X_test, y_test, gesture_names):
     plt.xlabel('预测类别')
     plt.ylabel('真实类别')
     plt.tight_layout()
-    plt.savefig('confusion_matrix.png')
+    plt.savefig('result/confusion_matrix.png')
     plt.close()
     
     print("混淆矩阵已保存到 'confusion_matrix.png'")
@@ -541,7 +548,7 @@ def visualize_landmark_importance():
     plt.xlim(0, 1)
     plt.ylim(0, 1)
     plt.axis('off')
-    plt.savefig('selected_landmarks.png')
+    plt.savefig('result/selected_landmarks.png')
     plt.close()
     print("所选关键点可视化已保存到 'selected_landmarks.png'")
 
@@ -678,7 +685,7 @@ def visualize_features(X, y, gesture_names):
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig('feature_visualization.png')
+    plt.savefig('result/feature_visualization.png')
     plt.close()
     print("特征可视化已保存到 'feature_visualization.png'")
 
@@ -735,7 +742,7 @@ def main():
         ),
         # 记录学习率变化
         tf.keras.callbacks.LambdaCallback(
-            on_epoch_end=lambda epoch, logs: logs.update({'lr': float(model.optimizer.lr.numpy())})
+            on_epoch_end=lambda epoch, logs: logs.update({'lr': float(model.optimizer.learning_rate.numpy())})
         )
     ]
     

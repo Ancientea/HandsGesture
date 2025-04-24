@@ -10,7 +10,7 @@ import threading
 from PyQt5.QtCore import QThread, pyqtSignal, QMutex
 
 # 提前定义手势名称列表，确保顺序一致
-GESTURE_NAMES = ["right_swipe", "left_swipe", "up_swipe", "down_swipe", "click", "pinch", "ok_sign", "peace_sign"]
+GESTURE_NAMES = ["right_swipe", "left_swipe", "up_swipe", "down_swipe", "click", "pinch", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
 # 选定的关键点ID - 掌根(0)、拇指(4)、食指(5,8)、中指(9,12)、无名指(13,16)、小指(17,20)
 SELECTED_LANDMARKS = [0, 4, 5, 9, 13, 17, 8, 12, 16, 20]
 # 更新输入维度
@@ -153,24 +153,25 @@ class GestureRecognition(QThread):
     def init_model(self):
         """初始化模型"""
         try:
-            # 尝试先加载选定关键点的模型
-            model_path = "saved_model_selected_landmarks"
+            # 尝试加载.h5格式的模型
+            model_path = "model_selected_landmarks.h5"
             if not os.path.exists(model_path):
-                model_path = "saved_model"  # 回退到原始模型
+                model_path = "best_model.h5"  # 回退到原始模型
                 print(f"警告: 找不到选定关键点的模型，尝试加载原始模型 {model_path}")
             
             if not os.path.exists(model_path):
-                print(f"错误：找不到模型文件夹 {model_path}")
-                self.status_signal.emit("错误：找不到模型文件夹")
+                print(f"错误：找不到模型文件 {model_path}")
+                self.status_signal.emit("错误：找不到模型文件")
                 self.model = None
                 return
             
             print(f"正在加载模型 {model_path}...")
             print(f"TensorFlow版本: {tf.version.VERSION}")
             
-            # 加载SavedModel格式的模型
+            # 加载.h5格式的模型
             try:
-                self.model = tf.keras.models.load_model(model_path)
+                # 使用 tf.keras.models.load_model 加载模型
+                self.model = tf.keras.models.load_model(model_path, compile=False)
                 print("模型加载成功")
                 print(f"使用关键点IDs: {SELECTED_LANDMARKS}")
                 print(f"输入维度: {INPUT_DIM}")
@@ -185,9 +186,9 @@ class GestureRecognition(QThread):
                 self.model = None
                 return
             
-            # 编译模型 - 与train.py中build_model使用的配置保持一致
+            # 编译模型 - 使用与 TensorFlow 2.10.0 兼容的配置
             self.model.compile(
-                optimizer='adam',
+                optimizer=tf.keras.optimizers.Adam(),
                 loss='categorical_crossentropy',
                 metrics=['accuracy']
             )
@@ -198,7 +199,6 @@ class GestureRecognition(QThread):
         except Exception as e:
             print(f"模型初始化失败: {str(e)}")
             self.status_signal.emit(f"模型初始化失败: {str(e)}")
-            self.model = None
     
     def process_shared_frame(self, frame):
         """处理从主程序共享的帧"""

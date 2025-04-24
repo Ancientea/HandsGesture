@@ -1,12 +1,22 @@
               precision    recall  f1-score   support
 
- right_swipe       1.00      1.00      1.00        45
-  left_swipe       1.00      1.00      1.00        46
-    up_swipe       1.00      1.00      1.00        43
-  down_swipe       1.00      1.00      1.00        44
-       click       1.00      1.00      1.00        48
-       pinch       1.00      1.00      1.00        41
+ right_swipe       0.98      1.00      0.99        52
+  left_swipe       1.00      0.98      0.99        52
+    up_swipe       1.00      1.00      1.00        48
+  down_swipe       1.00      1.00      1.00        49
+       click       1.00      1.00      1.00        51
+       pinch       1.00      1.00      1.00        43
+         one       1.00      1.00      1.00        44
+         two       1.00      1.00      1.00        44
+       three       1.00      1.00      1.00        44
+        four       1.00      1.00      1.00        45
+        five       1.00      1.00      1.00        42
+         six       1.00      1.00      1.00        45
+       seven       1.00      1.00      1.00        42
+       eight       1.00      1.00      1.00        42
+        nine       1.00      1.00      1.00        42
+         ten       1.00      1.00      1.00        47
 
-    accuracy                           1.00       267
-   macro avg       1.00      1.00      1.00       267
-weighted avg       1.00      1.00      1.00       267
+    accuracy                           1.00       732
+   macro avg       1.00      1.00      1.00       732
+weighted avg       1.00      1.00      1.00       732

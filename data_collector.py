@@ -18,8 +18,8 @@ def set_global_font():
         font.setFamily("SimHei")  # 黑体
     QApplication.setFont(font)
 
-# 定义手势类别
-GESTURES = ["right_swipe", "left_swipe", "up_swipe", "down_swipe", "click", "pinch"]
+# 定义手势类别 - 数字手势放前面，基本手势放后面
+GESTURES = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "right_swipe", "left_swipe", "up_swipe", "down_swipe", "click", "pinch"]
 # 定义手势中文名称
 GESTURE_NAMES = {
     "right_swipe": "右滑",
@@ -27,7 +27,17 @@ GESTURE_NAMES = {
     "up_swipe": "上滑",
     "down_swipe": "下滑",
     "click": "点击",
-    "pinch": "捏合"
+    "pinch": "捏合",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10"
 }
 DATA_DIR = "gesture_data"  # 数据集保存目录
 FRAME_COUNT = 30  # 1秒采集30帧
@@ -40,7 +50,7 @@ STABLE_FRAMES = 5  # 稳定帧数阈值
 class CameraThread(QThread):
     frame_signal = pyqtSignal(np.ndarray)
 
-    def __init__(self, camera_id=0):#这里可以更改你的摄像头id
+    def __init__(self, camera_id=1):#这里可以更改你的摄像头id
         super().__init__()
         self.camera_id = camera_id
         self.running = True
@@ -83,35 +93,56 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("手势数据收集")
         self.setGeometry(100, 100, 800, 600)
 
-        # 创建按钮布局
-        button_layout = QHBoxLayout()
+        # 主布局
+        main_layout = QVBoxLayout()
+        
+        # 创建两行按钮布局
+        button_layout_top = QHBoxLayout()
+        button_layout_bottom = QHBoxLayout()
+        
+        # 按钮容器
         self.gesture_buttons = {}
+        
+        # 创建手势按钮并放入两行
         for i, gesture in enumerate(GESTURES):
-            # 使用中文名称 + 英文名称
-            btn_text = f"{i+1}: {GESTURE_NAMES[gesture]}({gesture})"
+            # 为按钮生成快捷键标签文本
+            if i < 10:  # 数字手势用1-9和0
+                shortcut_key = str(i + 1) if i < 9 else "0"
+            else:  # 基本手势用Q,W,E,R,T,Y
+                letters = ['Q', 'W', 'E', 'R', 'T', 'Y']
+                letter_index = i - 10
+                shortcut_key = letters[letter_index] if letter_index < len(letters) else ""
+            
+            btn_text = f"{shortcut_key}: {GESTURE_NAMES[gesture]}({gesture})"
             btn = QPushButton(btn_text)
             btn.setFont(QFont("Microsoft YaHei", 9))  # 设置按钮字体
             btn.clicked.connect(lambda _, g=gesture: self.start_collect(g))
-            button_layout.addWidget(btn)
+            
+            # 前8个放第一行，后8个放第二行
+            if i < 8:
+                button_layout_top.addWidget(btn)
+            else:
+                button_layout_bottom.addWidget(btn)
+                
             self.gesture_buttons[gesture] = btn
+        
+        # 添加按钮布局到主布局
+        main_layout.addLayout(button_layout_top)
+        main_layout.addLayout(button_layout_bottom)
 
         # 状态显示
         self.status_label = QLabel("准备就绪")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))  # 设置字体
+        main_layout.addWidget(self.status_label)
         
         # 图像显示区域
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
-
-        # 主布局
-        main_layout = QVBoxLayout()
-        main_layout.addLayout(button_layout)
-        main_layout.addWidget(self.status_label)
         main_layout.addWidget(self.image_label)
 
         # 说明标签
-        help_label = QLabel("按键1-6可以快速选择对应的手势，ESC键取消当前采集")
+        help_label = QLabel("数字键1-9和0对应10个数字手势，字母键Q、W、E、R、T、Y对应6个基本手势，ESC键取消当前采集")
         help_label.setAlignment(Qt.AlignCenter)
         help_label.setFont(QFont("Microsoft YaHei", 9))  # 设置字体
         main_layout.addWidget(help_label)
@@ -123,10 +154,22 @@ class MainWindow(QMainWindow):
     def setup_shortcuts(self):
         """设置键盘快捷键"""
         for i, gesture in enumerate(GESTURES):
-            # 创建快捷键 1-6，对应六种手势
-            shortcut = QShortcut(QKeySequence(str(i+1)), self)
-            shortcut.activated.connect(lambda g=gesture: self.start_collect(g))
-            print(f"设置快捷键 {i+1} 对应手势 {GESTURE_NAMES[gesture]}({gesture})")
+            # 创建快捷键，对应所有手势
+            if i < 10:
+                # 1-9和0对应前10个数字手势
+                shortcut_key = str(i + 1) if i < 9 else "0"
+                shortcut = QShortcut(QKeySequence(shortcut_key), self)
+                shortcut.activated.connect(lambda g=gesture: self.start_collect(g))
+                print(f"设置快捷键 {shortcut_key} 对应手势 {GESTURE_NAMES[gesture]}({gesture})")
+            elif i < 16:  
+                # 使用字母键Q,W,E,R,T,Y对应6个基本手势
+                letters = ['Q', 'W', 'E', 'R', 'T', 'Y']
+                letter_index = i - 10
+                if letter_index < len(letters):
+                    letter = letters[letter_index]
+                    shortcut = QShortcut(QKeySequence(letter), self)
+                    shortcut.activated.connect(lambda g=gesture: self.start_collect(g))
+                    print(f"设置快捷键 {letter} 对应手势 {GESTURE_NAMES[gesture]}({gesture})")
 
     def init_mediapipe(self):
         self.mp_hands = mp.solutions.hands
@@ -357,6 +400,11 @@ class MainWindow(QMainWindow):
             if max_motion < 0.08 or avg_motion < 0.04:
                 print(f"警告：{self.current_gesture}动作幅度过小 (最大: {max_motion:.4f}, 平均: {avg_motion:.4f})")
                 return False
+        elif self.current_gesture in ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]:
+            # 数字手势需要稳定的动作，但要求一定的动作变化
+            if max_motion < 0.05 or avg_motion < 0.02:
+                print(f"警告：{self.current_gesture}动作幅度过小 (最大: {max_motion:.4f}, 平均: {avg_motion:.4f})")
+                return False
         else:  # click, pinch
             # 点击和捏合需要较小的运动量
             if max_motion < 0.06 or avg_motion < 0.03:
@@ -393,6 +441,10 @@ class MainWindow(QMainWindow):
                 return False
         elif self.current_gesture in ["up_swipe", "down_swipe"]:
             if max_distance < 0.15:  # 上下滑动需要适中的相对位移
+                print(f"警告：{self.current_gesture}最大相对位移过小 (距离: {max_distance:.4f})")
+                return False
+        elif self.current_gesture in ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]:
+            if max_distance < 0.04:  # 数字手势需要稳定但有一定的位移
                 print(f"警告：{self.current_gesture}最大相对位移过小 (距离: {max_distance:.4f})")
                 return False
         else:  # click, pinch
@@ -444,11 +496,27 @@ class MainWindow(QMainWindow):
         
     def keyPressEvent(self, event):
         """处理按键事件"""
-        if Qt.Key_1 <= event.key() <= Qt.Key_6:
-            # 按键1-6对应手势列表中的索引0-5
+        # 检查数字键1-9和0 - 对应数字手势
+        if Qt.Key_1 <= event.key() <= Qt.Key_9:
             index = event.key() - Qt.Key_1
             if 0 <= index < len(GESTURES):
                 self.start_collect(GESTURES[index])
+        elif event.key() == Qt.Key_0:  # 0键对应第10个手势
+            if 9 < len(GESTURES):
+                self.start_collect(GESTURES[9])
+        # 检查字母键Q,W,E,R,T,Y - 对应基本手势
+        elif event.key() == Qt.Key_Q and 10 < len(GESTURES):
+            self.start_collect(GESTURES[10])  # 第11个手势 (index=10)
+        elif event.key() == Qt.Key_W and 11 < len(GESTURES):
+            self.start_collect(GESTURES[11])  # 第12个手势 (index=11)
+        elif event.key() == Qt.Key_E and 12 < len(GESTURES):
+            self.start_collect(GESTURES[12])  # 第13个手势 (index=12)
+        elif event.key() == Qt.Key_R and 13 < len(GESTURES):
+            self.start_collect(GESTURES[13])  # 第14个手势 (index=13)
+        elif event.key() == Qt.Key_T and 14 < len(GESTURES):
+            self.start_collect(GESTURES[14])  # 第15个手势 (index=14)
+        elif event.key() == Qt.Key_Y and 15 < len(GESTURES):
+            self.start_collect(GESTURES[15])  # 第16个手势 (index=15)
         elif event.key() == Qt.Key_Escape:  # ESC键停止当前收集
             if self.current_gesture:
                 self.current_gesture = None

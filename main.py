@@ -15,10 +15,11 @@ from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QObject, QThread, QMutex, QSize
 # 导入自定义模块
 from recognition import GestureRecognition
 from mouseControl import MouseControlThread
+from handsControl import HandsControlThread  # 导入新的手势控制类
 
 # 与train.py保持一致的配置
 # 提前定义手势名称列表，确保顺序一致
-GESTURE_NAMES = ["right_swipe", "left_swipe", "up_swipe", "down_swipe", "click", "pinch", "ok_sign", "peace_sign"]
+GESTURE_NAMES = ["right_swipe", "left_swipe", "up_swipe", "down_swipe", "click", "pinch", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
 # 选定的关键点ID - 掌根(0)、拇指(4)、食指(5,8)、中指(9,12)、无名指(13,16)、小指(17,20)
 SELECTED_LANDMARKS = [0, 4, 5, 9, 13, 17, 8, 12, 16, 20]
 # 更新输入维度
@@ -57,9 +58,6 @@ class CameraThread(QThread):
         self.latest_frame = None
         self.latest_processed_frame = None
         
-        # 摄像头尺寸 - 初始化为默认值
-        self.camera_width = 640
-        self.camera_height = 480
         
         # MediaPipe设置 - 基本手部检测
         self.mp_hands = mp.solutions.hands
@@ -276,10 +274,19 @@ class HandGestureApp(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        # 应用状态
+        # 初始化状态变量
         self.camera_running = False
         self.recognition_running = False
         self.mouse_control_running = False
+        self.display_mutex = QMutex()  # 用于线程安全的显示更新
+        self.saved_sequence = None  # 保存的动作序列
+        
+        # 设置定时器
+        self.frame_update_timer = QTimer(self)
+        self.frame_update_timer.timeout.connect(self.update_frame_display)
+        self.frame_update_timer.setInterval(20)  # 50fps，提高帧率，从25ms改为20ms
+        
+        # 应用状态
         self.last_update_time = time.time()
         self.frame_count = 0
         self.fps = 0
@@ -288,22 +295,31 @@ class HandGestureApp(QMainWindow):
         self.camera_width = 640
         self.camera_height = 480
         
-        # 动作检测参数 - 从main1.py导入
+        # 动作检测参数
         self.action_started = False  # 动作开始标志
+        self.has_prediction = False  # 当前动作是否已经产生预测结果
         self.last_prediction = ""  # 上一次预测结果
         self.confirmation_count = 0  # 确认计数器
         self.current_gesture = "无动作"
         
         # 手势特定的阈值 - 优化检测灵敏度
         self.gesture_thresholds = {
-            "right_swipe": {"motion": 0.08, "distance": 0.2, "stable_frames": 5},
-            "left_swipe": {"motion": 0.08, "distance": 0.2, "stable_frames": 5},
-            "up_swipe": {"motion": 0.08, "distance": 0.15, "stable_frames": 5},
-            "down_swipe": {"motion": 0.08, "distance": 0.15, "stable_frames": 5},
-            "click": {"motion": 0.06, "distance": 0.05, "stable_frames": 3},
-            "pinch": {"motion": 0.06, "distance": 0.05, "stable_frames": 3},
-            "ok_sign": {"motion": 0.06, "distance": 0.05, "stable_frames": 3},
-            "peace_sign": {"motion": 0.06, "distance": 0.05, "stable_frames": 3}
+            "right_swipe": {"motion": 0.08, "distance": 0.1, "stable_frames": 5},
+            "left_swipe": {"motion": 0.08, "distance": 0.1, "stable_frames": 5},
+            "up_swipe": {"motion": 0.08, "distance": 0.08, "stable_frames": 5},
+            "down_swipe": {"motion": 0.08, "distance": 0.08, "stable_frames": 5},
+            "click": {"motion": 0.06, "distance": 0.03, "stable_frames": 3},
+            "pinch": {"motion": 0.06, "distance": 0.03, "stable_frames": 3},
+            "one": {"motion": 0.06, "distance": 0.03, "stable_frames": 3},
+            "two": {"motion": 0.06, "distance": 0.03, "stable_frames": 3},
+            "three": {"motion": 0.06, "distance": 0.03, "stable_frames": 3},
+            "four": {"motion": 0.06, "distance": 0.03, "stable_frames": 3},
+            "five": {"motion": 0.06, "distance": 0.03, "stable_frames": 3},
+            "six": {"motion": 0.06, "distance": 0.03, "stable_frames": 3},
+            "seven": {"motion": 0.06, "distance": 0.03, "stable_frames": 3},
+            "eight": {"motion": 0.06, "distance": 0.03, "stable_frames": 3},
+            "nine": {"motion": 0.06, "distance": 0.03, "stable_frames": 3},
+            "ten": {"motion": 0.06, "distance": 0.03, "stable_frames": 3}
         }
         
         # 动作检测参数
@@ -320,17 +336,11 @@ class HandGestureApp(QMainWindow):
         self.sequence_length = SEQUENCE_LENGTH
         self.data_buffer = deque(maxlen=self.sequence_length)
         
-        # 显示控制 - 避免多线程更新UI
-        self.display_mutex = QMutex()
-        self.display_priority = "camera"  # camera/recognition/mouse
-        self.frame_update_timer = QTimer(self)
-        self.frame_update_timer.timeout.connect(self.update_frame_display)
-        self.frame_update_timer.setInterval(20)  # 50fps，提高帧率，从25ms改为20ms
-        
         # 创建线程
         self.camera_thread = CameraThread(camera_id=0)
         self.gesture_recognition = GestureRecognition()
         self.mouse_control = MouseControlThread()
+        self.hands_control = HandsControlThread()  # 添加手势控制线程
         
         # 设置UI
         self.init_ui()
@@ -358,6 +368,7 @@ class HandGestureApp(QMainWindow):
         # 创建显示区域 - 修改为自适应窗口大小
         self.display_label = QLabel()
         self.display_label.setAlignment(Qt.AlignCenter)
+        
         # 设置初始尺寸为摄像头尺寸，允许缩放
         self.display_label.setMinimumSize(self.camera_width // 2, self.camera_height // 2)
         self.display_label.setMaximumSize(self.camera_width * 2, self.camera_height * 2)
@@ -418,32 +429,6 @@ class HandGestureApp(QMainWindow):
         
         main_layout.addLayout(button_layout)
         
-        # 同时运行复选框
-        self.simultaneous_checkbox = QCheckBox("同时运行手势识别和鼠标控制")
-        self.simultaneous_checkbox.setEnabled(False)  # 初始禁用
-        main_layout.addWidget(self.simultaneous_checkbox)
-        
-        # 显示控制选项
-        display_layout = QHBoxLayout()
-        display_layout.addWidget(QLabel("显示优先级: "))
-        
-        self.display_camera_radio = QRadioButton("摄像头")
-        self.display_camera_radio.setChecked(True)
-        self.display_camera_radio.toggled.connect(lambda: self.set_display_priority("camera"))
-        
-        self.display_recognition_radio = QRadioButton("手势识别")
-        self.display_recognition_radio.toggled.connect(lambda: self.set_display_priority("recognition"))
-        
-        self.display_mouse_radio = QRadioButton("鼠标控制")
-        self.display_mouse_radio.toggled.connect(lambda: self.set_display_priority("mouse"))
-        
-        display_layout.addWidget(self.display_camera_radio)
-        display_layout.addWidget(self.display_recognition_radio)
-        display_layout.addWidget(self.display_mouse_radio)
-        display_layout.addStretch()
-        
-        main_layout.addLayout(display_layout)
-        
         # 创建中央部件
         central_widget = QWidget()
         central_widget.setLayout(main_layout)
@@ -451,12 +436,6 @@ class HandGestureApp(QMainWindow):
         
         # 允许窗口大小调整时更新布局
         self.setMinimumSize(640, 480)
-    
-    def set_display_priority(self, priority):
-        """设置显示优先级"""
-        self.display_mutex.lock()
-        self.display_priority = priority
-        self.display_mutex.unlock()
     
     def connect_signals(self):
         """连接信号和槽"""
@@ -472,6 +451,10 @@ class HandGestureApp(QMainWindow):
         # 连接鼠标控制信号
         self.mouse_control.status_signal.connect(self.update_status)
         self.mouse_control.frame_signal.connect(self.update_mouse_frame)
+        
+        # 连接手势控制信号
+        self.hands_control.status_signal.connect(self.update_status)
+        self.hands_control.mode_switch_signal.connect(self.switch_control_mode)
     
     def toggle_camera(self):
         """切换摄像头状态"""
@@ -489,7 +472,6 @@ class HandGestureApp(QMainWindow):
             self.camera_button.setText("停止摄像头")
             self.recognition_button.setEnabled(True)
             self.mouse_control_button.setEnabled(True)
-            self.simultaneous_checkbox.setEnabled(True)
             self.update_status("摄像头已启动")
             
             # 启动帧更新定时器
@@ -518,7 +500,6 @@ class HandGestureApp(QMainWindow):
             self.camera_button.setText("启动摄像头")
             self.recognition_button.setEnabled(False)
             self.mouse_control_button.setEnabled(False)
-            self.simultaneous_checkbox.setEnabled(False)
             self.display_label.clear()
             self.update_status("摄像头已停止")
         except Exception as e:
@@ -534,9 +515,8 @@ class HandGestureApp(QMainWindow):
     def start_recognition(self):
         """启动手势识别"""
         try:
-            # 如果设置了同时运行，则保持鼠标控制运行
-            # 否则，先停止鼠标控制
-            if not self.simultaneous_checkbox.isChecked() and self.mouse_control_running:
+            # 先停止鼠标控制（互斥操作）
+            if self.mouse_control_running:
                 self.stop_mouse_control()
             
             # 启动手势识别
@@ -545,9 +525,9 @@ class HandGestureApp(QMainWindow):
             self.recognition_button.setText("停止手势识别")
             self.update_status("手势识别已启动")
             
-            # 更新显示优先级
-            if not self.mouse_control_running:
-                self.display_recognition_radio.setChecked(True)
+            # 同时启动手势控制
+            self.hands_control.start_control()
+            self.update_status("手势控制已启动")
         except Exception as e:
             self.show_error(f"启动手势识别错误: {str(e)}")
 
@@ -559,11 +539,9 @@ class HandGestureApp(QMainWindow):
             self.recognition_button.setText("启动手势识别")
             self.update_status("手势识别已停止")
             
-            # 更新显示优先级
-            if self.mouse_control_running:
-                self.display_mouse_radio.setChecked(True)
-            else:
-                self.display_camera_radio.setChecked(True)
+            # 同时停止手势控制
+            self.hands_control.stop_control()
+            self.update_status("手势控制已停止")
         except Exception as e:
             self.show_error(f"停止手势识别错误: {str(e)}")
     
@@ -577,9 +555,8 @@ class HandGestureApp(QMainWindow):
     def start_mouse_control(self):
         """启动鼠标控制"""
         try:
-            # 如果设置了同时运行，则保持手势识别运行
-            # 否则，先停止手势识别
-            if not self.simultaneous_checkbox.isChecked() and self.recognition_running:
+            # 先停止手势识别（互斥操作）
+            if self.recognition_running:
                 self.stop_recognition()
             
             # 启动鼠标控制
@@ -587,10 +564,6 @@ class HandGestureApp(QMainWindow):
             self.mouse_control_running = True
             self.mouse_control_button.setText("停止鼠标控制")
             self.update_status("鼠标控制已启动")
-            
-            # 更新显示优先级
-            if not self.recognition_running:
-                self.display_mouse_radio.setChecked(True)
         except Exception as e:
             self.show_error(f"启动鼠标控制错误: {str(e)}")
     
@@ -601,12 +574,6 @@ class HandGestureApp(QMainWindow):
             self.mouse_control_running = False
             self.mouse_control_button.setText("启动鼠标控制")
             self.update_status("鼠标控制已停止")
-            
-            # 更新显示优先级
-            if self.recognition_running:
-                self.display_recognition_radio.setChecked(True)
-            else:
-                self.display_camera_radio.setChecked(True)
         except Exception as e:
             self.show_error(f"停止鼠标控制错误: {str(e)}")
     
@@ -623,18 +590,20 @@ class HandGestureApp(QMainWindow):
                 self.frame_count = 0
                 self.last_update_time = current_time
             
-            # 为鼠标控制共享帧 - 使用直接方式传递帧，避免线程池导致的错误
+            # 为鼠标控制共享帧 - 减少不必要的帧复制操作
             if self.mouse_control_running:
-                # 创建帧的副本并直接传递
                 try:
-                    frame_for_mouse = frame.copy()
-                    self.send_frame_signal.emit(frame_for_mouse)
+                    # 每2帧处理一次以减少计算负担，同时保持足够的响应性
+                    if self.frame_count % 2 == 0:
+                        # 注意：此处不再创建帧的副本，而是直接传递原始帧
+                        # 由接收方负责创建副本（如果需要）
+                        self.send_frame_signal.emit(frame)
                 except Exception as e:
                     print(f"帧传递错误: {str(e)}")
             
             # 手势识别处理
             if self.recognition_running:
-                # 使用锁确保线程安全 - 减少处理负担和避免死锁
+                # 创建帧副本供手势识别使用
                 frame_copy = frame.copy()
                 
                 # 手部检测和手势识别处理
@@ -668,7 +637,9 @@ class HandGestureApp(QMainWindow):
                         
                         # 更新UI显示当前运动量 - 使用直接方式更新UI
                         try:
-                            self.update_motion_signal.emit("运动量", current_motion)
+                            # 每3帧更新一次UI，减少UI更新频率
+                            if self.frame_count % 3 == 0:
+                                self.update_motion_signal.emit("运动量", current_motion)
                         except Exception as e:
                             print(f"UI更新错误: {str(e)}")
                         
@@ -676,6 +647,7 @@ class HandGestureApp(QMainWindow):
                         if not self.action_started:
                             if current_motion > self.current_thresholds["motion"]:
                                 self.action_started = True
+                                self.has_prediction = False  # 重置预测状态
                                 self.initial_position = self.calculate_relative_distance(frame_data)
                                 self.max_distance = 0
                                 self.data_buffer.clear()  # 清空之前的数据
@@ -704,10 +676,20 @@ class HandGestureApp(QMainWindow):
                                         print(f"检测到动作结束 (最大相对位移: {self.max_distance:.4f})")
                                         self.update_action_signal.emit("检测到动作结束", self.max_distance)
                                         if len(self.data_buffer) >= 15:  # 至少收集15帧才进行预测
+                                            # 标记动作已经开始预测
+                                            self.has_prediction = True
                                             self.run_prediction()
+                                        else:
+                                            # 动作帧数不足，无法预测，标记为无动作
+                                            print("帧数不足，无法预测")
+                                            self.update_result_signal.emit("无动作")
+                                            self.update_motion_signal.emit("帧数不足", 0.0)
                                     else:
                                         print(f"动作不完整，放弃预测 (最大相对位移: {self.max_distance:.4f})")
                                         self.update_action_signal.emit("动作不完整，放弃预测", self.max_distance)
+                                        # 标记为无动作
+                                        self.update_result_signal.emit("无动作")
+                                        self.update_motion_signal.emit("位移不足", self.max_distance)
                                         self.action_started = False
                                         self.stable_frames = 0
                                         self.data_buffer.clear()
@@ -719,12 +701,16 @@ class HandGestureApp(QMainWindow):
                         self.action_started = False
                         self.data_buffer.clear()
                     
-                    self.update_motion_signal.emit("无手势", 0.0)
-                    self.update_action_signal.emit("等待手势", 0.0)
+                    # 降低无手势状态下的UI更新频率
+                    if self.frame_count % 5 == 0:
+                        self.update_motion_signal.emit("无手势", 0.0)
+                        self.update_action_signal.emit("等待手势", 0.0)
                 
                 # 将处理后的帧传递给手势识别模块 - 使用直接方式传递帧
                 try:
-                    self.gesture_recognition.process_shared_frame(frame_copy)
+                    # 由于手势识别处理相对耗时，减少处理频率
+                    if self.frame_count % 2 == 0:
+                        self.gesture_recognition.process_shared_frame(frame_copy)
                 except Exception as e:
                     print(f"帧处理错误: {str(e)}")
             
@@ -801,16 +787,28 @@ class HandGestureApp(QMainWindow):
         # 获取掌根坐标(0号点)
         palm = np.array(frame_data[0:2])  # 只取x,y坐标
         
-        # 获取指尖坐标并计算相对位移
-        # 索引6是食指尖(对应原始关键点8)
-        index_finger = np.array(frame_data[6*3:6*3+2]) - palm  # 食指尖
-        # 索引7是中指尖(对应原始关键点12)
-        middle_finger = np.array(frame_data[7*3:7*3+2]) - palm  # 中指尖
-        # 索引8是无名指尖(对应原始关键点16)
-        ring_finger = np.array(frame_data[8*3:8*3+2]) - palm  # 无名指尖
-        
-        # 计算加权平均
-        return 0.5 * index_finger + 0.25 * middle_finger + 0.25 * ring_finger
+        # 获取当前手势类型，以决定如何计算相对位移
+        if hasattr(self, 'current_gesture') and self.current_gesture in ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]:
+            # 对于数字手势，关注所有指尖的位置
+            thumb_tip = np.array(frame_data[1*3:1*3+2]) - palm  # 拇指尖（索引1对应原始关键点4）
+            index_finger = np.array(frame_data[6*3:6*3+2]) - palm  # 食指尖
+            middle_finger = np.array(frame_data[7*3:7*3+2]) - palm  # 中指尖
+            ring_finger = np.array(frame_data[8*3:8*3+2]) - palm  # 无名指尖
+            pinky_finger = np.array(frame_data[9*3:9*3+2]) - palm  # 小指尖
+            
+            # 综合考虑所有手指的位置
+            return 0.2 * thumb_tip + 0.2 * index_finger + 0.2 * middle_finger + 0.2 * ring_finger + 0.2 * pinky_finger
+        else:
+            # 获取指尖坐标并计算相对位移
+            # 索引6是食指尖(对应原始关键点8)
+            index_finger = np.array(frame_data[6*3:6*3+2]) - palm  # 食指尖
+            # 索引7是中指尖(对应原始关键点12)
+            middle_finger = np.array(frame_data[7*3:7*3+2]) - palm  # 中指尖
+            # 索引8是无名指尖(对应原始关键点16)
+            ring_finger = np.array(frame_data[8*3:8*3+2]) - palm  # 无名指尖
+            
+            # 计算加权平均
+            return 0.5 * index_finger + 0.25 * middle_finger + 0.25 * ring_finger
     
     def run_prediction(self):
         """运行预测逻辑"""
@@ -857,12 +855,17 @@ class HandGestureApp(QMainWindow):
             
             # 直接更新结果显示
             if confidence > 0.2:  # 置信度阈值
+                # 标记已经有了有效的预测结果
+                self.has_prediction = True
                 self.update_result_signal.emit(gesture)
                 self.current_gesture = gesture
                 self.last_prediction = gesture
                 self.confirmation_count = 1
                 # 立即更新可能的手势
                 self.update_motion_signal.emit(f"检测到: {gesture}", confidence)
+                
+                # 将手势传递给手势控制模块处理
+                self.hands_control.process_gesture(gesture, confidence)
             else:
                 self.update_result_signal.emit("无动作")
                 self.update_motion_signal.emit("置信度过低", confidence)
@@ -909,35 +912,34 @@ class HandGestureApp(QMainWindow):
     
     def update_mouse_frame(self, frame):
         """更新鼠标控制模式的帧显示"""
-        if self.display_priority == "mouse":
-            # 确保鼠标控制模式下的帧更新是线程安全的
-            try:
-                h, w, c = frame.shape
-                # 先转换为QImage，再创建QPixmap
-                q_img = QImage(frame.data, w, h, w * c, QImage.Format_RGB888).rgbSwapped()
-                pixmap = QPixmap.fromImage(q_img)
-                
-                # 获取显示标签的当前大小
-                label_size = self.display_label.size()
-                
-                # 计算保持宽高比的缩放后尺寸
-                scaled_pixmap = pixmap.scaled(
-                    label_size, 
-                    Qt.KeepAspectRatio,  # 保持原始宽高比
-                    Qt.SmoothTransformation  # 使用平滑变换提高质量
-                )
-                
-                # 更新显示标签
-                self.display_label.setPixmap(scaled_pixmap)
-            except Exception as e:
-                print(f"更新鼠标控制帧错误: {str(e)}")
+        # 直接更新鼠标控制帧，不再检查display_priority
+        try:
+            h, w, c = frame.shape
+            # 先转换为QImage，再创建QPixmap
+            q_img = QImage(frame.data, w, h, w * c, QImage.Format_RGB888).rgbSwapped()
+            pixmap = QPixmap.fromImage(q_img)
+            
+            # 获取显示标签的当前大小
+            label_size = self.display_label.size()
+            
+            # 计算保持宽高比的缩放后尺寸
+            scaled_pixmap = pixmap.scaled(
+                label_size, 
+                Qt.KeepAspectRatio,  # 保持原始宽高比
+                Qt.SmoothTransformation  # 使用平滑变换提高质量
+            )
+            
+            # 更新显示标签
+            self.display_label.setPixmap(scaled_pixmap)
+        except Exception as e:
+            print(f"更新鼠标控制帧错误: {str(e)}")
 
     def handle_shared_frame(self, frame):
         """处理从手势识别共享的帧"""
         # 确保鼠标控制线程正在运行且处于共享模式
         if self.mouse_control_running and hasattr(self.mouse_control, 'process_shared_frame'):
             try:
-                # 将帧传递给鼠标控制线程处理
+                # 直接传递帧给鼠标控制线程处理，不进行额外复制
                 self.mouse_control.process_shared_frame(frame)
             except Exception as e:
                 print(f"共享帧错误: {str(e)}")
@@ -945,17 +947,13 @@ class HandGestureApp(QMainWindow):
     def update_frame_display(self):
         """定时更新帧显示 - 避免多线程频繁更新导致的UI闪烁"""
         try:
-            # 使用锁控制帧选择
-            self.display_mutex.lock()
-            priority = self.display_priority
-            self.display_mutex.unlock()
-            
             frame = None
             
-            if priority == "recognition" and self.recognition_running:
+            # 优先显示当前正在运行的功能的帧
+            if self.recognition_running:
                 # 获取手势识别处理后的帧
                 frame = self.gesture_recognition.get_latest_frame()
-            elif priority == "mouse" and self.mouse_control_running:
+            elif self.mouse_control_running:
                 # 获取鼠标控制处理后的帧
                 frame = self.mouse_control.get_latest_frame()
             else:
@@ -1011,14 +1009,12 @@ class HandGestureApp(QMainWindow):
                 
                 # 添加模式显示
                 status_text = ""
-                if self.recognition_running and self.mouse_control_running:
-                    status_text = "模式: 手势识别 + 鼠标控制"
-                elif self.recognition_running:
-                    status_text = "模式: 手势识别"
+                if self.recognition_running:
+                    status_text = "Mode: Gesture Recognition"
                 elif self.mouse_control_running:
-                    status_text = "模式: 鼠标控制"
+                    status_text = "Mode: Mouse Control"
                 else:
-                    status_text = "模式: 仅摄像头"
+                    status_text = "Mode: Camera Only"
                 
                 draw.text((10, 60), status_text, font=mode_font, fill=(255, 255, 0))
                 
@@ -1039,9 +1035,7 @@ class HandGestureApp(QMainWindow):
                 
                 # 添加模式显示
                 status_text = ""
-                if self.recognition_running and self.mouse_control_running:
-                    status_text = "Mode: Gesture + Mouse"
-                elif self.recognition_running:
+                if self.recognition_running:
                     status_text = "Mode: Gesture Recognition"
                 elif self.mouse_control_running:
                     status_text = "Mode: Mouse Control"
@@ -1130,6 +1124,14 @@ class HandGestureApp(QMainWindow):
                     self.mouse_control.wait(500)
                 except Exception as e:
                     print(f"等待鼠标控制线程停止时出错: {str(e)}")
+            
+            if self.hands_control is not None:
+                self.hands_control.stop_control()
+                try:
+                    # 等待最多0.5秒以确保线程停止
+                    self.hands_control.wait(500)
+                except Exception as e:
+                    print(f"等待手势控制线程停止时出错: {str(e)}")
                     
             # 等待一小段时间确保所有资源都被清理
             time.sleep(0.2)
@@ -1162,7 +1164,7 @@ class HandGestureApp(QMainWindow):
         try:
             print("保存应用设置...")
             # 这里可以添加设置保存代码，如果需要
-            # 例如保存摄像头ID、显示优先级等设置
+            # 例如保存摄像头ID等设置
         except Exception as e:
             print(f"保存设置出错: {str(e)}")
 
@@ -1177,6 +1179,51 @@ class HandGestureApp(QMainWindow):
         
         # 更新状态
         self.update_status(f"摄像头分辨率: {width}x{height}")
+
+    def switch_control_mode(self, mouse_mode):
+        """切换控制模式
+        
+        Args:
+            mouse_mode: True表示切换到鼠标模式，False表示切换到手势控制模式
+        """
+        try:
+            if mouse_mode:
+                # 切换到鼠标模式
+                self.update_status("切换到鼠标控制模式")
+                print("主界面响应：切换到鼠标控制模式")
+                
+                # 优化：直接调用鼠标控制，避免额外的UI更新和事件处理
+                if not self.mouse_control_running:
+                    # 直接启动鼠标控制线程
+                    self.mouse_control.start_control()
+                    self.mouse_control_running = True
+                    self.mouse_control_button.setText("停止鼠标控制")
+                    
+                    # 添加调试信息
+                    print("鼠标控制线程已启动")
+            else:
+                # 切换到手势控制模式
+                self.update_status("切换到手势控制模式")
+                print("主界面响应：切换到手势控制模式")
+                
+                # 优化：直接调用停止鼠标控制
+                if self.mouse_control_running:
+                    # 直接停止鼠标控制线程
+                    self.mouse_control.stop_control()
+                    self.mouse_control_running = False
+                    self.mouse_control_button.setText("启动鼠标控制")
+                    
+                    # 添加调试信息
+                    print("鼠标控制线程已停止")
+            
+            # 优化：批量处理UI更新，减少重绘次数
+            QApplication.processEvents()
+            
+        except Exception as e:
+            self.show_error(f"切换控制模式错误: {str(e)}")
+            print(f"切换控制模式错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
