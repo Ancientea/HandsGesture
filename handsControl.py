@@ -173,8 +173,40 @@ class HandsControlThread(QThread):
     def toggle_fullscreen(self):
         """切换全屏状态"""
         try:
-            keyboard.press_and_release('f11')  # 大多数媒体播放器使用F11切换全屏
-            self.status_signal.emit("切换全屏")
+            # 维护一个全屏状态变量（类属性）
+            if not hasattr(self, 'is_fullscreen'):
+                self.is_fullscreen = False
+            
+            self.is_fullscreen = not self.is_fullscreen
+            
+            if self.is_fullscreen:
+                # 进入全屏模式 - 尝试几种进入全屏的快捷键
+                self.status_signal.emit("进入全屏")
+                print("尝试进入全屏模式")
+                
+                # 尝试F11键（常用于浏览器）
+                keyboard.press_and_release('f11')
+                time.sleep(0.1)
+                
+                # 尝试F键（常用于视频播放器）
+                keyboard.press_and_release('f')
+                time.sleep(0.1)
+                
+                # 尝试回车键（某些全屏预览）
+                keyboard.press_and_release('enter')
+            else:
+                # 退出全屏模式 - 尝试几种退出全屏的快捷键
+                self.status_signal.emit("退出全屏")
+                print("尝试退出全屏模式")
+                
+                # 尝试ESC键（通用退出键）
+                keyboard.press_and_release('esc')
+                time.sleep(0.1)
+                
+                # 尝试F11键（浏览器退出全屏）
+                keyboard.press_and_release('f11')
+                time.sleep(0.1)
+            
         except Exception as e:
             self.status_signal.emit(f"切换全屏失败: {str(e)}")
     
