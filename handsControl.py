@@ -29,7 +29,7 @@ class HandsControlThread(QThread):
         
         # 添加模式切换检测
         self.six_gesture_times = []  # 记录"6"手势的时间
-        self.mode_switch_cooldown = 3.0  # 模式切换冷却时间
+        self.mode_switch_cooldown = 2.0  # 模式切换冷却时间，从3.0减少到2.0，使交互更流畅
         self.last_mode_switch_time = 0  # 上次模式切换时间
         self.mouse_mode = False  # 当前是否为鼠标模式
         
@@ -57,47 +57,14 @@ class HandsControlThread(QThread):
             
         current_time = time.time()
         
-        # 处理"6"手势的模式切换检测 - 调低置信度要求，确保更容易检测
-        if gesture == "six" and confidence > 0.2:  # 从0.25降低到0.2
-            print(f"检测到'6'手势，置信度: {confidence:.2f}")
-            self.six_gesture_times.append(current_time)
-            
-            # 添加更详细的调试信息
-            print(f"'6'手势历史: {[f'{t-self.six_gesture_times[0]:.1f}s' for t in self.six_gesture_times]}")
-            
-            # 只保留最近5秒内的手势记录
-            self.six_gesture_times = [t for t in self.six_gesture_times if current_time - t <= 5.0]
-            
-            # 检查是否有连续两个"6"手势
-            if len(self.six_gesture_times) >= 2:
-                # 确保两个手势的时间间隔合理(0.5-5秒)，避免误触发
-                time_diff = self.six_gesture_times[-1] - self.six_gesture_times[-2]
-                print(f"两个'6'手势间隔: {time_diff:.2f}秒")
-                
-                if 0.5 <= time_diff <= 5.0:
-                    # 确保模式切换有冷却时间
-                    if current_time - self.last_mode_switch_time > self.mode_switch_cooldown:
-                        self.last_mode_switch_time = current_time
-                        self.mouse_mode = not self.mouse_mode
-                        
-                        if self.mouse_mode:
-                            self.status_signal.emit("切换到鼠标控制模式")
-                            print("切换到鼠标控制模式")
-                        else:
-                            self.status_signal.emit("切换到手势控制模式")
-                            print("切换到手势控制模式")
-                        
-                        # 发出模式切换信号
-                        self.mode_switch_signal.emit(self.mouse_mode)
-                        
-                        # 清空手势记录
-                        self.six_gesture_times = []
-                        print("已清空手势记录，等待新的手势输入")
-                        return
-                    else:
-                        print(f"模式切换冷却中，距离上次切换: {current_time - self.last_mode_switch_time:.1f}秒")
-                else:
-                    print(f"手势间隔 {time_diff:.2f}秒 不在有效范围(0.5-5.0秒)内")
+        # 处理"6"手势的模式切换检测
+        if gesture == "six" and confidence > 0.3:  # 提高置信度阈值，从0.2提高到0.3，减少误触发
+            # 连续两次"6"手势触发模式切换
+            # self.check_mode_switch_gesture(current_time, confidence)
+            # 发出模式切换信号
+            print(f"检测到'6'手势，置信度: {confidence:.2f}，尝试切换模式")
+            self.check_mode_switch_gesture_single()
+            return
         
         # 如果处于鼠标模式，则不处理普通手势
         if self.mouse_mode:
@@ -129,6 +96,88 @@ class HandsControlThread(QThread):
         except Exception as e:
             self.status_signal.emit(f"动作执行错误: {str(e)}")
             print(f"动作执行错误: {str(e)}")
+            
+    def check_mode_switch_gesture(self, current_time, confidence):
+        """处理模式切换手势逻辑
+        
+        Args:
+            current_time: 当前时间
+            confidence: "6"手势的置信度
+        """
+        print(f"检测到'6'手势，置信度: {confidence:.2f}")
+        self.six_gesture_times.append(current_time)
+        
+        # 添加更详细的调试信息
+        print(f"'6'手势历史: {[f'{t-self.six_gesture_times[0]:.1f}s' for t in self.six_gesture_times]}")
+        
+        # 只保留最近5秒内的手势记录
+        self.six_gesture_times = [t for t in self.six_gesture_times if current_time - t <= 5.0]
+        
+        # 检查是否有连续两个"6"手势
+        if len(self.six_gesture_times) >= 2:
+            # 确保两个手势的时间间隔合理(0.5-5秒)，避免误触发
+            time_diff = self.six_gesture_times[-1] - self.six_gesture_times[-2]
+            print(f"两个'6'手势间隔: {time_diff:.2f}秒")
+            
+            if 0.5 <= time_diff <= 5.0:
+                # 确保模式切换有冷却时间
+                if current_time - self.last_mode_switch_time > self.mode_switch_cooldown:
+                    self.last_mode_switch_time = current_time
+                    self.mouse_mode = not self.mouse_mode
+                    
+                    if self.mouse_mode:
+                        self.status_signal.emit("切换到鼠标控制模式")
+                        print("切换到鼠标控制模式")
+                    else:
+                        self.status_signal.emit("切换到手势控制模式")
+                        print("切换到手势控制模式")
+                    
+                    # 发出模式切换信号
+                    self.mode_switch_signal.emit(self.mouse_mode)
+                    
+                    # 清空手势记录
+                    self.six_gesture_times = []
+                    print("已清空手势记录，等待新的手势输入")
+                else:
+                    print(f"模式切换冷却中，距离上次切换: {current_time - self.last_mode_switch_time:.1f}秒")
+            else:
+                print(f"手势间隔 {time_diff:.2f}秒 不在有效范围(0.5-5.0秒)内")
+    
+    def check_mode_switch_gesture_single(self):
+        """处理单次"6"手势即可切换模式的逻辑
+        
+        简化版的模式切换，不需要连续检测两次"6"手势，降低切换难度
+        """
+        current_time = time.time()
+        
+        # 确保模式切换有冷却时间，防止误触发
+        if current_time - self.last_mode_switch_time < self.mode_switch_cooldown:
+            time_left = self.mode_switch_cooldown - (current_time - self.last_mode_switch_time)
+            print(f"⏳ 模式切换冷却中，还需等待: {time_left:.1f}秒")
+            # 发送状态信号给UI显示
+            self.status_signal.emit(f"⏳ 模式切换冷却中: 还需等待{time_left:.1f}秒")
+            return
+        
+        # 更新最后模式切换时间
+        self.last_mode_switch_time = current_time
+        
+        # 切换模式状态
+        self.mouse_mode = not self.mouse_mode
+        
+        # 根据当前模式发送对应的状态信息
+        if self.mouse_mode:
+            self.status_signal.emit("✅ 已切换到鼠标控制模式")
+            print("✅ 已切换到鼠标控制模式")
+        else:
+            self.status_signal.emit("✅ 已切换到手势控制模式")
+            print("✅ 已切换到手势控制模式")
+        
+        # 发出模式切换信号
+        self.mode_switch_signal.emit(self.mouse_mode)
+        
+        # 添加更多的状态反馈
+        print(f"🔄 单次'6'手势成功触发模式切换，当前模式: {'🖱️ 鼠标控制' if self.mouse_mode else '👋 手势控制'}")
+        print(f"⚠️ 冷却期间: {self.mode_switch_cooldown}秒内无法再次切换模式")
     
     def volume_up(self):
         """增加音量"""
